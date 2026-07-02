@@ -1,0 +1,32 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "cvdt"
+version = "0.5.0"
+description = "Cross-Validated Decision Tree — scikit-learn-compatible estimators backed by a Rust core"
+readme = "PYTHON.md"
+requires-python = ">=3.8"
+license = { text = "MIT OR Apache-2.0" }
+keywords = ["decision-tree", "cross-validation", "scikit-learn", "rust", "machine-learning"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.21",
+    "scikit-learn>=1.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.maturin]
+# Mixed Rust/Python project: the Python sources live under python/, and the
+# compiled Rust extension is injected as the submodule cvdt._cvdt.
+features = ["python"]
+module-name = "cvdt._cvdt"
+python-source = "python"

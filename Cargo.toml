@@ -1,0 +1,34 @@
+[package]
+name = "cvdt"
+version = "0.5.0"
+edition = "2021"
+rust-version = "1.63"
+description = "Cross-Validated Decision Tree: split selection driven by K-fold cross-validated impurity evaluation."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "cvdt"
+path = "src/lib.rs"
+# `rlib`  : the pure-Rust core (used by the crate's own tests and Rust consumers)
+# `cdylib`: the Python extension module, built only with `--features python`
+crate-type = ["cdylib", "rlib"]
+
+# The CORE is intentionally zero-dependency (std only): parallelism via
+# std::thread::scope, RNG via a self-contained SplitMix64. It builds and tests
+# fully offline.
+#
+# The optional `python` feature is the ONLY thing that pulls dependencies
+# (PyO3 + the numpy crate) to expose a scikit-learn-compatible binding. It is
+# off by default, so the default build keeps the zero-dep guarantee.
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optional = true }
+numpy = { version = "0.22", optional = true }
+
+[features]
+default = []
+python = ["dep:pyo3", "dep:numpy"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
