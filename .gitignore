@@ -1,0 +1,17 @@
+# Rust build output
+/target
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.whl
+.pytest_cache/
+
+# Compiled extension artifacts landing in the source tree (maturin develop)
+*.pdb
+*.pyd
+*.so

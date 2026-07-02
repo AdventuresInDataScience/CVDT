@@ -2,8 +2,8 @@
 //! of the cross-validation engine and the parallel feature scorer.
 
 use cvdt::{
-    Average, Classification, Column, DecisionTree, FeatureValue, KFold, Mean, ObjectiveClassification,
-    Regression, SplitMode, TreeParams,
+    Average, Classification, Column, DecisionTree, FeatureValue, KFold, Mean,
+    ObjectiveClassification, Regression, SplitMode, TreeParams,
 };
 
 /// A small multi-feature classification problem (so several features compete,

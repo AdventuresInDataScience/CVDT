@@ -86,7 +86,8 @@ impl KFold {
         if self.shuffle {
             // Mix the node size into the seed so different nodes decorrelate,
             // while remaining fully reproducible for identical inputs.
-            let mut rng = SplitMix64::new(self.seed ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut rng =
+                SplitMix64::new(self.seed ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
             for i in (1..idx.len()).rev() {
                 let j = rng.below((i as u64) + 1) as usize;
                 idx.swap(i, j);

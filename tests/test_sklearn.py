@@ -50,7 +50,14 @@ def test_fast_mode_matches_strict_on_separable():
         class_sep=3.0, random_state=1,
     )
     strict = CVDTClassifier(mode="strict", cv_folds=4).fit(X, y)
-    fast = CVDTClassifier(mode="fast", cv_folds=4, n_bins=32).fit(X, y)
+    # Fast mode bins globally *once* and never re-subdivides, and each split is a
+    # one-vs-rest `feature == bin` test that isolates a single bin. With too many
+    # bins each split peels only a thin sliver, so with a bounded depth most of
+    # the data lands in one impure "rest" leaf. The bin count must therefore be
+    # matched to the data's granularity (unlike strict, which re-bins per node);
+    # 16 bins separate these clusters cleanly, whereas 32+ would strand the bulk
+    # of the samples. See the "Strict vs Fast mode" note in README.md.
+    fast = CVDTClassifier(mode="fast", cv_folds=4, n_bins=16).fit(X, y)
     assert strict.score(X, y) > 0.9
     assert fast.score(X, y) > 0.9
 
@@ -101,7 +108,11 @@ def test_objective_mode_learns(objective):
 
 def test_objective_recall_beats_gini_on_recall():
     # On an imbalanced problem, optimising recall should not do worse on recall
-    # than the impurity default (usually better).
+    # than the impurity default (usually better). Objective mode is self-stopping
+    # (a split must *improve* the metric over making the node a leaf), and for
+    # recall that threshold is reached quickly, yielding a very shallow tree. To
+    # let the recall objective actually express itself we allow non-improving
+    # splits via `min_impurity_decrease < 0`, exactly as the docstring documents.
     from sklearn.metrics import recall_score
 
     X, y = make_classification(
@@ -110,7 +121,8 @@ def test_objective_recall_beats_gini_on_recall():
     )
     gini = CVDTClassifier(cv_folds=4, max_depth=6).fit(X, y)
     rec = CVDTClassifier(
-        objective="recall", average="binary", pos_label=1, cv_folds=4, max_depth=6
+        objective="recall", average="binary", pos_label=1, cv_folds=4,
+        max_depth=6, min_impurity_decrease=-1.0,
     ).fit(X, y)
     r_gini = recall_score(y, gini.predict(X), pos_label=1, zero_division=0)
     r_rec = recall_score(y, rec.predict(X), pos_label=1, zero_division=0)

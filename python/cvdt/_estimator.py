@@ -11,6 +11,7 @@ from __future__ import annotations
 import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 from sklearn.preprocessing import LabelEncoder
+from sklearn.utils import validation as _skl_validation
 from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
 
@@ -22,20 +23,50 @@ from ._cvdt import RawClassifier, RawObjectiveClassifier, RawRegressor
 # sklearn renamed ``force_all_finite`` -> ``ensure_all_finite`` in 1.6. CVDT
 # routes NaN/non-finite continuous values to the right child on purpose, so we
 # must allow non-finite input. Try the new keyword first, fall back to the old.
+#
+# sklearn also moved the ``_check_feature_names`` / ``_check_n_features`` helpers
+# off ``BaseEstimator`` (instance methods, <= ~1.5) to module-level functions in
+# ``sklearn.utils.validation`` (>= ~1.6, and the instance methods are gone in
+# 1.9). Prefer the instance method when present, else the module function.
 # ---------------------------------------------------------------------------
 
+def _record_feature_names(est, X, reset):
+    method = getattr(est, "_check_feature_names", None)
+    if method is not None:
+        method(X, reset=reset)
+    else:
+        _skl_validation._check_feature_names(est, X, reset=reset)
+
+
+def _record_n_features(est, X, reset):
+    method = getattr(est, "_check_n_features", None)
+    if method is not None:
+        method(X, reset=reset)
+    else:
+        _skl_validation._check_n_features(est, X, reset=reset)
+
+
+# Pick the "allow non-finite" keyword once, by inspecting the signature, rather
+# than catching TypeError from the call itself — a data-driven TypeError raised
+# *inside* check_array (e.g. non-numeric input) must propagate unmasked.
+def _finite_kwarg(func):
+    import inspect
+
+    if "ensure_all_finite" in inspect.signature(func).parameters:
+        return {"ensure_all_finite": False}
+    return {"force_all_finite": False}
+
+
+_XY_FINITE = _finite_kwarg(check_X_y)
+_ARR_FINITE = _finite_kwarg(check_array)
+
+
 def _check_X_y(X, y):
-    try:
-        return check_X_y(X, y, dtype=np.float64, ensure_all_finite=False)
-    except TypeError:
-        return check_X_y(X, y, dtype=np.float64, force_all_finite=False)
+    return check_X_y(X, y, dtype=np.float64, **_XY_FINITE)
 
 
 def _check_array(X):
-    try:
-        return check_array(X, dtype=np.float64, ensure_all_finite=False)
-    except TypeError:
-        return check_array(X, dtype=np.float64, force_all_finite=False)
+    return check_array(X, dtype=np.float64, **_ARR_FINITE)
 
 
 def _normalise_categorical(categorical_features, n_features):
@@ -117,6 +148,30 @@ class _CVDTBase(BaseEstimator):
     def _more_tags(self):
         # sklearn < 1.6
         return {"allow_nan": True, "requires_y": True}
+
+    # -- pickling ----------------------------------------------------------
+    # The fitted model lives in the Rust extension object ``self._model``, which
+    # is not directly picklable. We instead persist its tree as the plain-array
+    # dict returned by ``export_tree`` (fully picklable) and rebuild the native
+    # model on load. Everything else (params, ``classes_``, ``n_features_in_``,
+    # ...) pickles normally via the estimator's ``__dict__``.
+    def __getstate__(self):
+        state = super().__getstate__()
+        state = dict(state) if state is not None else self.__dict__.copy()
+        model = state.pop("_model", None)
+        if model is not None:
+            state["__cvdt_tree__"] = model.export_tree()
+        return state
+
+    def __setstate__(self, state):
+        state = dict(state)
+        tree = state.pop("__cvdt_tree__", None)
+        super().__setstate__(state)
+        if tree is not None:
+            self._model = self._rebuild_model(tree)
+
+    def _rebuild_model(self, tree):  # pragma: no cover - overridden
+        raise NotImplementedError
 
 
 class CVDTClassifier(ClassifierMixin, _CVDTBase):
@@ -219,10 +274,10 @@ class CVDTClassifier(ClassifierMixin, _CVDTBase):
                     f"average must be one of {sorted(_AVERAGES)}, got {self.average!r}"
                 )
         # Record feature names from the original X before it is coerced.
-        self._check_feature_names(X, reset=True)
+        _record_feature_names(self, X, reset=True)
         X, y = _check_X_y(X, y)
         check_classification_targets(y)
-        self._check_n_features(X, reset=True)
+        _record_n_features(self, X, reset=True)
 
         self._encoder = LabelEncoder().fit(y)
         self.classes_ = self._encoder.classes_
@@ -255,17 +310,17 @@ class CVDTClassifier(ClassifierMixin, _CVDTBase):
 
     def predict(self, X):
         check_is_fitted(self)
-        self._check_feature_names(X, reset=False)
+        _record_feature_names(self, X, reset=False)
         X = _check_array(X)
-        self._check_n_features(X, reset=False)
+        _record_n_features(self, X, reset=False)
         idx = np.asarray(self._model.predict(np.ascontiguousarray(X, dtype=np.float64)))
         return self.classes_[idx]
 
     def predict_proba(self, X):
         check_is_fitted(self)
-        self._check_feature_names(X, reset=False)
+        _record_feature_names(self, X, reset=False)
         X = _check_array(X)
-        self._check_n_features(X, reset=False)
+        _record_n_features(self, X, reset=False)
         proba = np.asarray(
             self._model.predict_proba(np.ascontiguousarray(X, dtype=np.float64))
         )
@@ -300,6 +355,13 @@ class CVDTClassifier(ClassifierMixin, _CVDTBase):
         from ._treeviz import export_graphviz as _g
 
         return _g(self.get_tree(), feature_names=feature_names, class_names=class_names)
+
+    def _rebuild_model(self, tree):
+        n_classes = int(len(self.classes_))
+        cat = _normalise_categorical(self.categorical_features, self.n_features_in_)
+        if self.objective is None:
+            return RawClassifier.from_tree(tree, n_classes, cat)
+        return RawObjectiveClassifier.from_tree(tree, n_classes, cat)
 
 
 class CVDTRegressor(RegressorMixin, _CVDTBase):
@@ -360,9 +422,9 @@ class CVDTRegressor(RegressorMixin, _CVDTBase):
             raise ValueError(
                 f"criterion must be 'mse', 'variance' or 'mae', got {self.criterion!r}"
             )
-        self._check_feature_names(X, reset=True)
+        _record_feature_names(self, X, reset=True)
         X, y = _check_X_y(X, y)
-        self._check_n_features(X, reset=True)
+        _record_n_features(self, X, reset=True)
         y = np.asarray(y, dtype=np.float64)
 
         cat = _normalise_categorical(self.categorical_features, X.shape[1])
@@ -377,9 +439,9 @@ class CVDTRegressor(RegressorMixin, _CVDTBase):
 
     def predict(self, X):
         check_is_fitted(self)
-        self._check_feature_names(X, reset=False)
+        _record_feature_names(self, X, reset=False)
         X = _check_array(X)
-        self._check_n_features(X, reset=False)
+        _record_n_features(self, X, reset=False)
         return np.asarray(self._model.predict(np.ascontiguousarray(X, dtype=np.float64)))
 
     def get_depth(self):
@@ -408,3 +470,7 @@ class CVDTRegressor(RegressorMixin, _CVDTBase):
         from ._treeviz import export_graphviz as _g
 
         return _g(self.get_tree(), feature_names=feature_names)
+
+    def _rebuild_model(self, tree):
+        cat = _normalise_categorical(self.categorical_features, self.n_features_in_)
+        return RawRegressor.from_tree(tree, cat)

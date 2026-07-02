@@ -1,0 +1,5 @@
+# Windows/schannel can fail cargo's TLS cert-revocation check on some networks
+# (CRYPT_E_NO_REVOCATION_CHECK), aborting crate downloads. Skip that check so
+# `cargo`/`maturin` fetches (e.g. the `python` feature's pyo3 + numpy) succeed.
+[http]
+check-revoke = false

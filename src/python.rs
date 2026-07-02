@@ -18,10 +18,10 @@ use crate::aggregation::{
     Aggregator, Mean, MeanMinusLambdaStd, Median, SignalToNoise, TrimmedMean,
 };
 use crate::data::{CatId, Column, FeatureValue, UNKNOWN_CAT};
-use crate::objective::{Accuracy, Average, ClassObjective, FBeta, F1, Precision, Recall};
+use crate::objective::{Accuracy, Average, ClassObjective, FBeta, Precision, Recall, F1};
 use crate::tree::{
-    Classification, DecisionTree, ExportedNode, ObjectiveClassification, Regression, SplitMode,
-    TreeParams,
+    ClassPrediction, Classification, DecisionTree, ExportedNode, Node, ObjectiveClassification,
+    Regression, SplitMode, SplitRule, TreeParams,
 };
 
 // Pack a flattened tree into a Python dict of parallel arrays. `with_classes`
@@ -76,6 +76,117 @@ fn tree_to_dict<'py>(
         d.set_item("value", value)?;
     }
     Ok(d)
+}
+
+// --------------------------------------------------------------------------
+// Tree reconstruction (for unpickling a fitted estimator)
+//
+// The inverse of `tree_to_dict`: rebuild the node tree from the parallel arrays
+// produced by `export_tree`. Prediction reads only the node tree, so a model
+// rebuilt this way predicts identically to the original.
+// --------------------------------------------------------------------------
+
+fn get_vec<'py, T: FromPyObject<'py>>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Vec<T>> {
+    d.get_item(key)?
+        .ok_or_else(|| PyValueError::new_err(format!("tree state missing key {key:?}")))?
+        .extract()
+}
+
+/// The flat node arrays shared by classification and regression exports.
+struct FlatTree {
+    is_leaf: Vec<bool>,
+    left: Vec<i64>,
+    right: Vec<i64>,
+    feature: Vec<i64>,
+    is_categorical: Vec<bool>,
+    lower: Vec<f64>,
+    upper: Vec<f64>,
+    category: Vec<i64>,
+    n_samples: Vec<u64>,
+}
+
+impl FlatTree {
+    fn from_dict(d: &Bound<PyDict>) -> PyResult<Self> {
+        let ft = FlatTree {
+            is_leaf: get_vec(d, "is_leaf")?,
+            left: get_vec(d, "children_left")?,
+            right: get_vec(d, "children_right")?,
+            feature: get_vec(d, "feature")?,
+            is_categorical: get_vec(d, "is_categorical")?,
+            lower: get_vec(d, "lower")?,
+            upper: get_vec(d, "upper")?,
+            category: get_vec(d, "category")?,
+            n_samples: get_vec(d, "n_samples")?,
+        };
+        if ft.is_leaf.is_empty() {
+            return Err(PyValueError::new_err("tree state has no nodes"));
+        }
+        Ok(ft)
+    }
+
+    /// Reconstruct the routing rule for internal node `id`. `export_tree` writes
+    /// open bin ends as +/-inf, so those map back to `None` bounds.
+    fn rule_at(&self, id: usize) -> SplitRule {
+        if self.is_categorical[id] {
+            SplitRule::Category {
+                feature: self.feature[id] as usize,
+                category: self.category[id] as u32,
+            }
+        } else {
+            let lo = self.lower[id];
+            let hi = self.upper[id];
+            SplitRule::ContinuousBin {
+                feature: self.feature[id] as usize,
+                lower: (!(lo.is_infinite() && lo.is_sign_negative())).then_some(lo),
+                upper: (!(hi.is_infinite() && hi.is_sign_positive())).then_some(hi),
+            }
+        }
+    }
+}
+
+fn build_class_node(
+    ft: &FlatTree,
+    class: &[i64],
+    proba: &[Vec<f64>],
+    id: usize,
+) -> Node<ClassPrediction> {
+    if ft.is_leaf[id] {
+        Node::Leaf {
+            prediction: ClassPrediction {
+                class: class[id].max(0) as usize,
+                proba: proba[id].clone(),
+            },
+            n_samples: ft.n_samples[id] as usize,
+        }
+    } else {
+        Node::Internal {
+            rule: ft.rule_at(id),
+            left: Box::new(build_class_node(ft, class, proba, ft.left[id] as usize)),
+            right: Box::new(build_class_node(ft, class, proba, ft.right[id] as usize)),
+        }
+    }
+}
+
+fn build_regr_node(ft: &FlatTree, value: &[f64], id: usize) -> Node<f64> {
+    if ft.is_leaf[id] {
+        Node::Leaf {
+            prediction: value[id],
+            n_samples: ft.n_samples[id] as usize,
+        }
+    } else {
+        Node::Internal {
+            rule: ft.rule_at(id),
+            left: Box::new(build_regr_node(ft, value, ft.left[id] as usize)),
+            right: Box::new(build_regr_node(ft, value, ft.right[id] as usize)),
+        }
+    }
+}
+
+fn sorted_categorical(categorical: Vec<usize>) -> Vec<usize> {
+    let mut c = categorical;
+    c.sort_unstable();
+    c.dedup();
+    c
 }
 
 // --------------------------------------------------------------------------
@@ -180,12 +291,7 @@ fn build_params(
     })
 }
 
-fn build_aggregator(
-    name: &str,
-    frac: f64,
-    eps: f64,
-    lambda: f64,
-) -> PyResult<Box<dyn Aggregator>> {
+fn build_aggregator(name: &str, frac: f64, eps: f64, lambda: f64) -> PyResult<Box<dyn Aggregator>> {
     Ok(match name {
         "mean" => Box::new(Mean),
         "median" => Box::new(Median),
@@ -379,6 +485,31 @@ impl RawClassifier {
         }
         tree_to_dict(py, &self.inner.export_nodes(), true, self.n_classes)
     }
+
+    /// Rebuild a fitted classifier from an `export_tree` dump (used to unpickle).
+    #[staticmethod]
+    fn from_tree(
+        tree: &Bound<PyDict>,
+        n_classes: usize,
+        categorical: Vec<usize>,
+    ) -> PyResult<Self> {
+        let ft = FlatTree::from_dict(tree)?;
+        let class: Vec<i64> = get_vec(tree, "predicted_class")?;
+        let proba: Vec<Vec<f64>> = get_vec(tree, "proba")?;
+        let root = build_class_node(&ft, &class, &proba, 0);
+        let mut inner = DecisionTree::new(
+            Classification::gini(n_classes),
+            TreeParams::default(),
+            Box::new(Mean),
+        );
+        inner.set_fitted_root(root);
+        Ok(Self {
+            inner,
+            n_classes,
+            categorical: sorted_categorical(categorical),
+            fitted: true,
+        })
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -521,6 +652,32 @@ impl RawObjectiveClassifier {
         }
         tree_to_dict(py, &self.inner.export_nodes(), true, self.n_classes)
     }
+
+    /// Rebuild a fitted objective classifier from an `export_tree` dump. The
+    /// objective plays no part in prediction, so a placeholder task is used.
+    #[staticmethod]
+    fn from_tree(
+        tree: &Bound<PyDict>,
+        n_classes: usize,
+        categorical: Vec<usize>,
+    ) -> PyResult<Self> {
+        let ft = FlatTree::from_dict(tree)?;
+        let class: Vec<i64> = get_vec(tree, "predicted_class")?;
+        let proba: Vec<Vec<f64>> = get_vec(tree, "proba")?;
+        let root = build_class_node(&ft, &class, &proba, 0);
+        let mut inner = DecisionTree::new(
+            ObjectiveClassification::accuracy(n_classes),
+            TreeParams::default(),
+            Box::new(Mean),
+        );
+        inner.set_fitted_root(root);
+        Ok(Self {
+            inner,
+            n_classes,
+            categorical: sorted_categorical(categorical),
+            fitted: true,
+        })
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -638,6 +795,21 @@ impl RawRegressor {
         }
         tree_to_dict(py, &self.inner.export_nodes(), false, 0)
     }
+
+    /// Rebuild a fitted regressor from an `export_tree` dump (used to unpickle).
+    #[staticmethod]
+    fn from_tree(tree: &Bound<PyDict>, categorical: Vec<usize>) -> PyResult<Self> {
+        let ft = FlatTree::from_dict(tree)?;
+        let value: Vec<f64> = get_vec(tree, "value")?;
+        let root = build_regr_node(&ft, &value, 0);
+        let mut inner = DecisionTree::new(Regression::mse(), TreeParams::default(), Box::new(Mean));
+        inner.set_fitted_root(root);
+        Ok(Self {
+            inner,
+            categorical: sorted_categorical(categorical),
+            fitted: true,
+        })
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -650,6 +822,9 @@ fn _cvdt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RawClassifier>()?;
     m.add_class::<RawObjectiveClassifier>()?;
     m.add_class::<RawRegressor>()?;
-    m.add("__doc__", "Native CVDT core (Rust/PyO3). Use cvdt.CVDTClassifier / cvdt.CVDTRegressor.")?;
+    m.add(
+        "__doc__",
+        "Native CVDT core (Rust/PyO3). Use cvdt.CVDTClassifier / cvdt.CVDTRegressor.",
+    )?;
     Ok(())
 }

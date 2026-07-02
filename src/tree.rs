@@ -21,8 +21,8 @@ use crate::data::{Bin, Column, FeatureValue, SampleId, UNKNOWN_CAT};
 use crate::encoder::{bin_bounds, quantile_edges};
 use crate::histogram::{score_classif, score_regr, ClassImpurityKind, FastScratch};
 use crate::objective::{
-    eval_feature_objective, score_classif_objective, Accuracy, Average, ClassObjective, FBeta, F1,
-    Precision, Recall,
+    eval_feature_objective, score_classif_objective, Accuracy, Average, ClassObjective, FBeta,
+    Precision, Recall, F1,
 };
 use crate::parallel::par_map;
 use crate::selector::{select_best, ScoredCandidate};
@@ -785,7 +785,15 @@ fn build_node<K: Task>(
     // Per-feature scoring closure, delegated to the task so alternative
     // strict-path scorers (e.g. objective metrics) plug in transparently.
     let eval_one = |f: &usize| -> Vec<ScoredCandidate> {
-        task.score_feature_strict(columns, targets, *f, indices, &folds, params.n_bins, aggregator)
+        task.score_feature_strict(
+            columns,
+            targets,
+            *f,
+            indices,
+            &folds,
+            params.n_bins,
+            aggregator,
+        )
     };
 
     let feature_ids: Vec<usize> = (0..columns.len()).collect();
@@ -835,7 +843,15 @@ fn build_node<K: Task>(
     }
 
     // --- recurse (tree growth is sequential by design) ---------------------
-    let left = build_node(task, params, aggregator, columns, targets, &left_idx, depth + 1);
+    let left = build_node(
+        task,
+        params,
+        aggregator,
+        columns,
+        targets,
+        &left_idx,
+        depth + 1,
+    );
     let right = build_node(
         task,
         params,
@@ -997,7 +1013,15 @@ fn build_node_fast<K: Task>(
 
     let (left_s, right_s) = samples.split_at_mut(p);
     let left = build_node_fast(task, params, aggregator, binned, targets, left_s, depth + 1);
-    let right = build_node_fast(task, params, aggregator, binned, targets, right_s, depth + 1);
+    let right = build_node_fast(
+        task,
+        params,
+        aggregator,
+        binned,
+        targets,
+        right_s,
+        depth + 1,
+    );
     Node::Internal {
         rule,
         left: Box::new(left),
@@ -1039,7 +1063,10 @@ impl<K: Task> DecisionTree<K> {
         let n = columns[0].len();
         for (i, c) in columns.iter().enumerate() {
             if c.len() != n {
-                return Err(format!("column {i} has length {} but expected {n}", c.len()));
+                return Err(format!(
+                    "column {i} has length {} but expected {n}",
+                    c.len()
+                ));
             }
         }
         if targets.len() != n {
@@ -1085,6 +1112,16 @@ impl<K: Task> DecisionTree<K> {
             }
         }
         Ok(())
+    }
+
+    /// Install a pre-built tree as the fitted model.
+    ///
+    /// Prediction reads only the node tree (see [`predict_node`]), so a tree
+    /// rebuilt from an [`ExportedNode`] dump predicts identically to the original
+    /// regardless of the task/params/aggregator the estimator was created with.
+    /// Used to reconstruct a fitted estimator when unpickling.
+    pub fn set_fitted_root(&mut self, root: Node<K::Prediction>) {
+        self.root = Some(root);
     }
 
     /// Predict a single sample. Panics if the tree has not been fitted.

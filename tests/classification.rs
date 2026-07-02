@@ -73,10 +73,7 @@ fn probabilities_are_valid() {
     let (cols, y) = separable();
     let mut t = DecisionTree::new(Classification::gini(2), params(5, 7), Box::new(Mean));
     t.fit(&cols, &y).unwrap();
-    let preds = t.predict(&[
-        vec![FeatureValue::cont(0.1)],
-        vec![FeatureValue::cont(3.3)],
-    ]);
+    let preds = t.predict(&[vec![FeatureValue::cont(0.1)], vec![FeatureValue::cont(3.3)]]);
     for p in &preds {
         assert_eq!(p.proba.len(), 2);
         let s: f64 = p.proba.iter().sum();

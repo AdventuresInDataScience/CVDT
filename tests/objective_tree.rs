@@ -31,21 +31,44 @@ fn class_at(tree: &DecisionTree<ObjectiveClassification>, x: f64) -> usize {
 
 #[test]
 fn each_objective_learns_separable_strict() {
+    // Objectives that reward getting *both* classes right separate the clusters.
+    // Recall is deliberately excluded: recall of the positive class is maximised
+    // (=1.0) by predicting the positive class for everything, so a recall-driven
+    // tree correctly collapses to an all-positive prediction rather than
+    // separating the data — that case is checked in `recall_prefers_all_positive`.
     let (cols, y) = separable();
     let tasks = [
         ObjectiveClassification::f1(2, Average::Binary { pos_label: 1 }),
         ObjectiveClassification::precision(2, Average::Macro),
-        ObjectiveClassification::recall(2, Average::Binary { pos_label: 1 }),
         ObjectiveClassification::accuracy(2),
         ObjectiveClassification::fbeta(2, 2.0, Average::Binary { pos_label: 1 }),
     ];
     for task in tasks {
         let mut t = DecisionTree::new(task, params(5, 7), Box::new(Mean));
         t.fit(&cols, &y).unwrap();
-        assert!(t.n_leaves() >= 2, "objective tree should split separable data");
+        assert!(
+            t.n_leaves() >= 2,
+            "objective tree should split separable data"
+        );
         assert_eq!(class_at(&t, 0.2), 0);
         assert_eq!(class_at(&t, 3.3), 1);
     }
+}
+
+#[test]
+fn recall_prefers_all_positive() {
+    // Recall of the positive class has no penalty for false positives, so its
+    // greedy optimum on any data is to predict the positive class everywhere
+    // (recall = 1.0). The tree should therefore label both clusters positive.
+    let (cols, y) = separable();
+    let mut t = DecisionTree::new(
+        ObjectiveClassification::recall(2, Average::Binary { pos_label: 1 }),
+        params(5, 7),
+        Box::new(Mean),
+    );
+    t.fit(&cols, &y).unwrap();
+    assert_eq!(class_at(&t, 0.2), 1);
+    assert_eq!(class_at(&t, 3.3), 1);
 }
 
 #[test]

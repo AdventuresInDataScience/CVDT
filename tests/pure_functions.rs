@@ -26,7 +26,7 @@ fn gini_known_values() {
 fn entropy_known_values() {
     approx(Entropy::new(2).impurity(&[0, 1]), 1.0); // 1 bit
     approx(Entropy::new(2).impurity(&[1, 1, 1, 1]), 0.0); // pure
-    // p=(0.75, 0.25): -(0.75 log2 0.75 + 0.25 log2 0.25)
+                                                          // p=(0.75, 0.25): -(0.75 log2 0.75 + 0.25 log2 0.25)
     let expect = -(0.75_f64 * 0.75_f64.log2() + 0.25_f64 * 0.25_f64.log2());
     approx(Entropy::new(2).impurity(&[0, 0, 0, 1]), expect);
 }
@@ -110,7 +110,10 @@ fn empty_stats_sink_to_neg_infinity() {
     let empty = FoldStats::from_scores(vec![], 5);
     assert_eq!(Mean.aggregate(&empty), f64::NEG_INFINITY);
     assert_eq!(Median.aggregate(&empty), f64::NEG_INFINITY);
-    assert_eq!(SignalToNoise { eps: 1e-9 }.aggregate(&empty), f64::NEG_INFINITY);
+    assert_eq!(
+        SignalToNoise { eps: 1e-9 }.aggregate(&empty),
+        f64::NEG_INFINITY
+    );
 }
 
 #[test]

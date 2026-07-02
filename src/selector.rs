@@ -75,7 +75,13 @@ mod tests {
     fn picks_highest_score() {
         let v = vec![sc(0, 0, 0.1), sc(1, 2, 0.9), sc(2, 1, 0.5)];
         let best = select_best(&v).unwrap();
-        assert_eq!(best.candidate, Candidate { feature: 1, state: 2 });
+        assert_eq!(
+            best.candidate,
+            Candidate {
+                feature: 1,
+                state: 2
+            }
+        );
     }
 
     #[test]
@@ -83,7 +89,13 @@ mod tests {
         let v = vec![sc(3, 5, 0.5), sc(1, 9, 0.5), sc(1, 2, 0.5)];
         let best = select_best(&v).unwrap();
         // All tied on score -> smallest (feature, state) = (1, 2).
-        assert_eq!(best.candidate, Candidate { feature: 1, state: 2 });
+        assert_eq!(
+            best.candidate,
+            Candidate {
+                feature: 1,
+                state: 2
+            }
+        );
     }
 
     #[test]
@@ -94,7 +106,13 @@ mod tests {
             sc(2, 2, 0.3),
         ];
         let best = select_best(&v).unwrap();
-        assert_eq!(best.candidate, Candidate { feature: 2, state: 2 });
+        assert_eq!(
+            best.candidate,
+            Candidate {
+                feature: 2,
+                state: 2
+            }
+        );
     }
 
     #[test]

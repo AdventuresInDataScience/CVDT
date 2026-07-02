@@ -349,10 +349,30 @@ mod tests {
         let val_fold: Vec<u8> = vec![0, 0, 1, 1];
         let mut sc = FastScratch::new();
         let a = score_classif(
-            &codes, &labels, &order, &val_fold, 2, 2, 2, ClassImpurityKind::Gini, &Mean, 0, &mut sc,
+            &codes,
+            &labels,
+            &order,
+            &val_fold,
+            2,
+            2,
+            2,
+            ClassImpurityKind::Gini,
+            &Mean,
+            0,
+            &mut sc,
         );
         let b = score_classif(
-            &codes, &labels, &order, &val_fold, 2, 2, 2, ClassImpurityKind::Gini, &Mean, 0, &mut sc,
+            &codes,
+            &labels,
+            &order,
+            &val_fold,
+            2,
+            2,
+            2,
+            ClassImpurityKind::Gini,
+            &Mean,
+            0,
+            &mut sc,
         );
         assert_eq!(a.len(), b.len());
         for (x, y) in a.iter().zip(b.iter()) {

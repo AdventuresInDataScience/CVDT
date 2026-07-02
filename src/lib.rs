@@ -72,10 +72,10 @@ pub use encoder::{bin_of, quantile_edges, MISSING_BIN};
 pub use histogram::{score_classif, score_regr, ClassImpurityKind, FastScratch};
 pub use objective::{
     eval_feature_objective, score_classif_objective, Accuracy, Average, ClassObjective, Confusion,
-    FBeta, F1, Precision, Recall,
+    FBeta, Precision, Recall, F1,
 };
 pub use selector::{select_best, ScoredCandidate};
 pub use tree::{
-    Classification, ClassPrediction, DecisionTree, ExportedNode, LeafInfo, Node,
+    ClassPrediction, Classification, DecisionTree, ExportedNode, LeafInfo, Node,
     ObjectiveClassification, Regression, SplitMode, SplitRule, Task, TreeParams,
 };
