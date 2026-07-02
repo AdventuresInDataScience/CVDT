@@ -1,24 +1,93 @@
 # CVDT — Cross-Validated Decision Tree
 
-A from-scratch, zero-dependency decision tree in Rust whose novelty is **how
-splits are scored**. Instead of estimating impurity once on the in-sample node
-data, every candidate split is evaluated with **K-fold cross-validation** and the
-per-fold scores are aggregated into a single robust ranking value. The tree
-itself is deliberately ordinary; the cross-validated split-evaluation framework
-is the point.
+CVDT is a decision tree whose novelty is **how splits are scored**. A classical
+tree picks the split that most reduces impurity on the node's own data — an
+in-sample estimate that is easy to overfit. CVDT instead scores every candidate
+split by **K-fold cross-validation**: it measures the impurity reduction each
+split achieves on *held-out* folds and aggregates the per-fold scores into a
+single robust ranking value. The result is a tree that selects splits which are
+not just good on average but *reliably* good across resamples.
 
-The crate uses only the standard library — no `rayon`, no `PyO3`, no external
-crates at all — so it builds and tests fully offline.
+**What you get:**
+
+- **Better-generalising splits out of the box** — the anti-overfit behaviour is
+  baked into split selection, not bolted on via post-hoc pruning.
+- **A tunable risk profile** — swap the fold-score aggregator (`mean`,
+  `median`, `trimmed_mean`, `signal_to_noise`, `mean - λ·std`, or your own) to
+  reward consistency or penalise volatile splits.
+- **Metric-driven trees** — optionally optimise splits for the metric you
+  actually care about (precision, recall, F1, Fβ, accuracy) instead of an
+  impurity proxy.
+- **Full explainability** — a fit produces a single, inspectable tree. Dump it
+  as readable rules, render it with Graphviz, or pull the raw node arrays out as
+  a dict for custom plots (see [Explainability](#explainability--inspect-the-fitted-tree)).
+- **scikit-learn compatible** — `CVDTClassifier` / `CVDTRegressor` drop into
+  `Pipeline`, `GridSearchCV`, `cross_val_score`, etc.
+- **Fast, portable core** — the engine is a from-scratch Rust crate that uses
+  **only the standard library** (no `rayon`, no `PyO3`, no external crates), so
+  it builds and tests fully offline; a histogram fast path and std-only
+  parallelism keep it quick.
+
+The tree structure itself is deliberately ordinary; the cross-validated
+split-evaluation framework is the point.
 
 ## The idea
 
-A classical tree asks: *of all splits, which most reduces impurity on the data
-at this node?* That estimate is in-sample and easy to overfit. CVDT instead
-asks: *which split most reduces impurity on held-out data, consistently across
-folds?* Each candidate is scored by cross-validation and the fold scores are
-collapsed by a pluggable aggregator, so you can select splits that are not just
-good on average but *reliably* good (e.g. `mean - λ·std`, or a signal-to-noise
-ratio).
+The key move is **decoupling how a split's fold scores are combined from the
+scoring itself**. Cross-validation gives each candidate a *vector* of per-fold
+gains; a pluggable aggregator collapses that vector into the one number used for
+ranking. Choosing the aggregator lets you express what "a good split" means:
+`mean` for average gain, `mean - λ·std` to penalise splits whose benefit is
+volatile across folds, or `signal_to_noise` to reward consistency directly. So
+beyond simply resisting overfitting, CVDT lets you tune the *risk profile* of
+split selection.
+
+## Explainability — inspect the fitted tree
+
+Because a fit is a single decision tree, it is fully transparent: you can read
+off exactly why any prediction was made. The scikit-learn estimators expose the
+fitted structure three ways.
+
+```python
+from cvdt import CVDTClassifier
+
+clf = CVDTClassifier(max_depth=3).fit(X, y)
+
+# 1. Readable, rule-style dump.
+print(clf.export_text(feature_names=["age", "bmi", "bp"],
+                      class_names=["healthy", "at-risk"]))
+```
+
+```
+if 22.5 <= bmi < 30.1:
+  if age < 47:
+    class=healthy n=180 proba=[0.911, 0.089]
+  else:  # not (age < 47)
+    class=at-risk n=95 proba=[0.221, 0.779]
+else:  # not (22.5 <= bmi < 30.1)
+  class=at-risk n=140 proba=[0.107, 0.893]
+```
+
+```python
+# 2. Graphviz DOT — render with graphviz, pydot, or dtreeviz.
+dot = clf.export_graphviz(feature_names=["age", "bmi", "bp"])
+
+# 3. Raw structure as a dict of parallel arrays, for custom plots or analysis.
+tree = clf.get_tree()
+tree["feature"]         # split feature per node
+tree["lower"], tree["upper"]   # continuous split interval [lo, hi)
+tree["children_left"], tree["children_right"]
+tree["is_leaf"], tree["n_samples"], tree["proba"]   # ("value" for regressors)
+
+clf.get_depth(), clf.get_n_leaves()   # sklearn-style size accessors
+```
+
+One thing to note when reading the output: CVDT splits are **membership tests**,
+not CART-style thresholds. A continuous split routes a sample down the *true*
+branch when its value falls in a half-open interval `[lo, hi)` (shown as a
+one-sided inequality when one end is open); a categorical split routes true when
+the feature equals a specific category. The "true" branch is always the one that
+matches — missing / non-finite values route to "false".
 
 ## Architecture
 
