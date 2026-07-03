@@ -15,12 +15,16 @@
 //! tested. The tree builder merely *orchestrates* these components; it contains
 //! no impurity, cross-validation or aggregation logic of its own.
 //!
-//! ## The unified split interface
-//! Every candidate split is a membership test `feature == state`:
+//! ## The split interface
+//! Candidates are enumerated over quantile bins as `feature == state`, and
+//! [`SplitStyle`] decides how a continuous `state` becomes a partition:
 //! * continuous features are quantile-binned (edges fit **only on the training
-//!   fold** to avoid leakage), so `state` is a bin id;
+//!   fold** to avoid leakage), so `state` is a bin id. With
+//!   [`SplitStyle::Threshold`] (default) the cut is CART-style ordered
+//!   (`x < edge`, left child = bins `0..=state`); with
+//!   [`SplitStyle::BinMembership`] it is one bin vs. the rest;
 //! * categorical features use their category id directly, so `state` is a
-//!   category id.
+//!   category id (always tested by equality).
 //!
 //! ## Per-fold score
 //! For a candidate on a validation fold the score is the *impurity decrease*
@@ -77,5 +81,5 @@ pub use objective::{
 pub use selector::{select_best, ScoredCandidate};
 pub use tree::{
     ClassPrediction, Classification, DecisionTree, ExportedNode, LeafInfo, Node,
-    ObjectiveClassification, Regression, SplitMode, SplitRule, Task, TreeParams,
+    ObjectiveClassification, Regression, SplitMode, SplitRule, SplitStyle, Task, TreeParams,
 };

@@ -258,6 +258,7 @@ pub(crate) fn fold_train_val_codes(
 /// fold is the impurity decrease on the validation labels:
 /// `parent - weighted_child`. A fold is skipped for a state when either child
 /// has fewer than `min_child` validation samples.
+#[allow(clippy::too_many_arguments)]
 pub fn eval_feature<T: Copy>(
     columns: &[Column],
     targets: &[T],
@@ -267,6 +268,7 @@ pub fn eval_feature<T: Copy>(
     n_bins: usize,
     criterion: &dyn Criterion<Target = T>,
     min_child: usize,
+    prefix: bool,
 ) -> Vec<FoldStats> {
     let mut per_state: Vec<Vec<f64>> = vec![Vec::with_capacity(folds.len()); states.len()];
     let min_child = min_child.max(1);
@@ -284,7 +286,15 @@ pub fn eval_feature<T: Copy>(
             let mut left: Vec<T> = Vec::new();
             let mut right: Vec<T> = Vec::new();
             for (k, &code) in codes.iter().enumerate() {
-                if code == state {
+                // Threshold: left is `code <= state` (i.e. `x < edge`). Missing
+                // codes are MISSING_BIN (u32::MAX) and never fall left, so they
+                // route right in both styles. Single-bin: left is `code == state`.
+                let goes_left = if prefix {
+                    code != crate::encoder::MISSING_BIN && code <= state
+                } else {
+                    code == state
+                };
+                if goes_left {
                     left.push(val_targets[k]);
                 } else {
                     right.push(val_targets[k]);
@@ -370,7 +380,7 @@ mod tests {
         let idx: Vec<usize> = (0..8).collect();
         let folds = KFold::new(4, 5).folds(&idx);
         let gini = Gini::new(2);
-        let stats = eval_feature(&columns, &targets, 0, &[0, 1], &folds, 2, &gini, 1);
+        let stats = eval_feature(&columns, &targets, 0, &[0, 1], &folds, 2, &gini, 1, false);
         // At least one state should show a strictly positive mean gain.
         assert!(stats.iter().any(|s| s.n_success > 0 && s.mean > 0.0));
     }

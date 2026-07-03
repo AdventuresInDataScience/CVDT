@@ -113,16 +113,23 @@ def test_objective_recall_beats_gini_on_recall():
     # recall that threshold is reached quickly, yielding a very shallow tree. To
     # let the recall objective actually express itself we allow non-improving
     # splits via `min_impurity_decrease < 0`, exactly as the docstring documents.
+    #
+    # This comparison is pinned to ``split_style="bin"`` so it isolates the
+    # *objective* (recall vs impurity) rather than the split geometry. With the
+    # default CART-style ``"threshold"`` splits the impurity tree is a much
+    # stronger general learner and can win outright on recall for a given
+    # dataset, which would make an "objective >= impurity on its own metric"
+    # comparison flaky; the single-bin path keeps the two trees comparable.
     from sklearn.metrics import recall_score
 
     X, y = make_classification(
         n_samples=800, n_features=10, n_informative=6, n_classes=2,
         weights=[0.85, 0.15], random_state=5,
     )
-    gini = CVDTClassifier(cv_folds=4, max_depth=6).fit(X, y)
+    gini = CVDTClassifier(cv_folds=4, max_depth=6, split_style="bin").fit(X, y)
     rec = CVDTClassifier(
         objective="recall", average="binary", pos_label=1, cv_folds=4,
-        max_depth=6, min_impurity_decrease=-1.0,
+        max_depth=6, min_impurity_decrease=-1.0, split_style="bin",
     ).fit(X, y)
     r_gini = recall_score(y, gini.predict(X), pos_label=1, zero_division=0)
     r_rec = recall_score(y, rec.predict(X), pos_label=1, zero_division=0)
@@ -206,6 +213,7 @@ def test_set_params_changes_behavior():
         {"criterion": "nonsense"},
         {"aggregator": "nope"},
         {"mode": "turbo"},
+        {"split_style": "sideways"},
         {"objective": "auc"},
         {"objective": "f1", "average": "bogus"},
         {"n_bins": 1},
@@ -274,10 +282,54 @@ def test_get_params_lists_all_hyperparameters():
         "criterion", "objective", "average", "pos_label", "beta",
         "max_depth", "min_samples_split", "min_samples_leaf",
         "min_impurity_decrease", "n_bins", "cv_folds", "cv_seed", "cv_shuffle",
-        "mode", "aggregator", "agg_frac", "agg_eps", "agg_lambda",
+        "mode", "split_style", "aggregator", "agg_frac", "agg_eps", "agg_lambda",
         "parallel", "n_threads", "parallel_min_samples", "categorical_features",
     }
     assert expected <= keys
+
+
+@pytest.mark.parametrize("style", ["threshold", "bin", "bin_membership"])
+@pytest.mark.parametrize("mode", ["strict", "fast"])
+def test_split_style_fits_and_predicts(style, mode):
+    # Both split styles, on both the strict and fast (histogram) paths, should
+    # learn a well-separated continuous problem.
+    X, y = make_classification(
+        n_samples=300, n_features=6, n_informative=4, n_classes=2, random_state=1
+    )
+    clf = CVDTClassifier(cv_folds=4, max_depth=6, n_bins=16, mode=mode, split_style=style)
+    clf.fit(X, y)
+    # A modest floor both styles clear; threshold typically scores much higher.
+    assert clf.score(X, y) > 0.7
+    reg = CVDTRegressor(cv_folds=4, max_depth=6, n_bins=16, mode=mode, split_style=style)
+    reg.fit(X, y.astype(float))
+    assert reg.predict(X).shape == (X.shape[0],)
+
+
+def test_threshold_splits_export_as_open_ended_cuts():
+    # A CART-style threshold cut is `x < edge`: the left branch has no finite
+    # lower bound (-inf), unlike a single-bin split which is a closed interval.
+    X, y = make_classification(
+        n_samples=300, n_features=6, n_informative=4, n_classes=2, random_state=2
+    )
+    clf = CVDTClassifier(cv_folds=4, max_depth=4, split_style="threshold").fit(X, y)
+    tree = clf.get_tree()
+    internal = [
+        i for i in range(tree["node_count"])
+        if not tree["is_leaf"][i] and not tree["is_categorical"][i]
+    ]
+    assert internal, "expected at least one continuous split"
+    # Every continuous threshold split opens downward (lower == -inf).
+    assert all(tree["lower"][i] == float("-inf") for i in internal)
+
+
+def test_split_style_survives_pickle():
+    import pickle
+
+    X, y = make_classification(n_samples=250, n_features=5, random_state=3)
+    clf = CVDTClassifier(cv_folds=4, max_depth=5, split_style="threshold").fit(X, y)
+    restored = pickle.loads(pickle.dumps(clf))
+    assert restored.split_style == "threshold"
+    np.testing.assert_array_equal(clf.predict(X), restored.predict(X))
 
 
 # Full estimator conformance. Kept last; if a specific sub-check is too strict

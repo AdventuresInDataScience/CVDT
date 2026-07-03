@@ -1,14 +1,18 @@
-# CVDT API Reference (v2)
+# CVDT API Reference (v3)
 
-Crate: `cvdt` v0.2.0 · Rust 2021 · MSRV 1.63 · zero dependencies
+Crate: `cvdt` v0.7.0 · Rust 2021 · MSRV 1.63 · zero dependencies
 
 This document describes every public item, organised by module. All listed
 types and functions are re-exported at the crate root, so `use cvdt::Gini;`
 works as well as `use cvdt::criterion::Gini;`.
 
-> **v2 adds a histogram "fast" build path** alongside the exact "strict" path.
-> New items are marked *(v2)*. The default behaviour is unchanged: `TreeParams`
-> defaults to `SplitMode::Strict`, so existing code keeps its v1 semantics.
+> **v2 adds a histogram "fast" build path** alongside the exact "strict" path;
+> items are marked *(v2)*. **v3 adds CART-style ordered threshold splits** for
+> continuous features, marked *(v3)*. Note the v3 default *changes behaviour*:
+> `TreeParams.split_style` defaults to `SplitStyle::Threshold`, so continuous
+> features are now cut as `x < edge` rather than one-bin-vs-rest. Set
+> `split_style: SplitStyle::BinMembership` to recover the v1/v2 semantics.
+> `mode` still defaults to `SplitMode::Strict`.
 
 Convention used below: **Target** is `usize` (class ids) for classification and
 `f64` for regression.
@@ -204,6 +208,7 @@ pub fn eval_feature<T: Copy>(
     n_bins: usize,
     criterion: &dyn Criterion<Target = T>,
     min_child: usize,
+    prefix: bool,
 ) -> Vec<FoldStats>
 ```
 One `FoldStats` per state (aligned with `states`). For each fold the continuous
@@ -211,7 +216,9 @@ bin edges are fit on the **training** samples only and applied to the
 validation samples (the leakage guard); the per-fold score is the impurity
 decrease on the validation labels,
 `parent - weighted_child`. A fold is skipped for a state when either child has
-fewer than `min_child` validation samples.
+fewer than `min_child` validation samples. *(v3)* `prefix = true` scores a
+threshold cut (left child is `code <= state`, i.e. `x < edge`); `false` scores
+single-bin membership (`code == state`).
 
 ---
 
@@ -259,10 +266,13 @@ pub fn score_classif(
     order: &[SampleId], val_fold: &[u8], k: usize,
     max_bin: usize, n_classes: usize, kind: ClassImpurityKind,
     aggregator: &dyn Aggregator, feature: usize, scratch: &mut FastScratch,
+    prefix: bool,
 ) -> Vec<ScoredCandidate>
 ```
-One `ScoredCandidate` per present bin (`feature == bin`), scored by CV gain on
-validation labels.
+One `ScoredCandidate` per candidate cut, scored by CV gain on validation labels.
+*(v3)* `prefix = true` sweeps threshold cuts (left child is bins `0..=state`, via
+a running per-fold class prefix); `false` scores single-bin membership
+(`feature == bin`).
 
 ### `fn score_regr(...) -> Vec<ScoredCandidate>`
 ```rust
@@ -271,9 +281,11 @@ pub fn score_regr(
     order: &[SampleId], val_fold: &[u8], k: usize,
     max_bin: usize, aggregator: &dyn Aggregator,
     feature: usize, scratch: &mut FastScratch,
+    prefix: bool,
 ) -> Vec<ScoredCandidate>
 ```
 Variance/MSE via `(count, Σy, Σy²)` moments. (MAE is unsupported on this path.)
+*(v3)* `prefix` selects threshold-sweep vs single-bin as in `score_classif`.
 
 ---
 
@@ -353,6 +365,16 @@ missing / non-finite values route right.
   MAE is not supported.
 Derives `Clone, Copy, Debug, PartialEq, Eq`.
 
+### `enum SplitStyle` *(v3)*
+How a continuous feature is partitioned at a split (categorical features are
+always tested by category equality; this enum has no effect on them).
+- `SplitStyle::Threshold` — CART-style ordered cut: left child is `x < edge`
+  where `edge` is a quantile boundary (default). Candidate cuts are the
+  `n_bins - 1` boundaries; the score is still cross-validated on held-out folds.
+- `SplitStyle::BinMembership` — one quantile bin vs. the rest
+  (`lower <= x < upper`), the original v1/v2 behaviour.
+Derives `Clone, Copy, Debug, PartialEq, Eq`.
+
 ### `trait Task: Send + Sync`
 - `type Target: Copy + Send + Sync`
 - `type Prediction: Clone`
@@ -362,9 +384,15 @@ Derives `Clone, Copy, Debug, PartialEq, Eq`.
   with no additive statistic (MAE).
 - `fn score_feature_fast(&self, codes: &[Bin], targets: &[Self::Target], order:
   &[SampleId], val_fold: &[u8], k: usize, max_bin: usize, feature: usize,
-  aggregator: &dyn Aggregator, scratch: &mut FastScratch) -> Vec<ScoredCandidate>`
-  *(v2)* — fast-path scorer for one feature; implementations delegate to
-  `histogram`.
+  aggregator: &dyn Aggregator, scratch: &mut FastScratch, prefix: bool) ->
+  Vec<ScoredCandidate>` *(v2; `prefix` added v3)* — fast-path scorer for one
+  feature; implementations delegate to `histogram`. `prefix = true` scores
+  CART-style threshold cuts (`code <= state`), `false` single-bin membership.
+- `fn score_feature_strict(&self, columns: &[Column], targets: &[Self::Target],
+  feature: usize, indices: &[usize], folds: &[Fold], n_bins: usize, aggregator:
+  &dyn Aggregator, prefix: bool) -> Vec<ScoredCandidate>` — strict-path scorer
+  (default delegates to `eval_feature`); `prefix` selects threshold vs single-bin
+  as above.
 
 ### `struct ClassPrediction`
 - `class: usize` (argmax; lowest id on ties), `proba: Vec<f64>` (per-class
@@ -393,6 +421,7 @@ Derives `Clone, Copy, Debug, PartialEq, Eq`.
 | `n_bins` | `usize` | `8` | quantile bins for continuous features |
 | `cv` | `KFold` | `KFold{k:5,seed:42,shuffle:true}` | CV configuration |
 | `mode` | `SplitMode` | `Strict` | *(v2)* exact vs histogram path |
+| `split_style` | `SplitStyle` | `Threshold` | *(v3)* continuous split geometry: ordered threshold vs single-bin |
 | `parallel` | `bool` | `false` | evaluate features in parallel |
 | `n_threads` | `usize` | `1` | worker threads when `parallel` |
 | `parallel_min_samples` | `usize` | `512` | *(v2)* min node size to parallelise |

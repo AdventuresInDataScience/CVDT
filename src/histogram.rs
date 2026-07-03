@@ -101,6 +101,7 @@ pub fn score_classif(
     aggregator: &dyn Aggregator,
     feature: usize,
     scratch: &mut FastScratch,
+    prefix: bool,
 ) -> Vec<ScoredCandidate> {
     let bins = max_bin;
     let c = n_classes;
@@ -147,6 +148,68 @@ pub fn score_classif(
     let mut left = vec![0u64; c];
     let mut right = vec![0u64; c];
     let mut out = Vec::new();
+
+    if prefix {
+        // Threshold sweep: cut after bin b -> left child is bins 0..=b. Maintain
+        // a running per-fold class prefix so each cut is O(k*c).
+        let mut pref = vec![0u64; k * c];
+        let mut pref_n = vec![0u64; k];
+        for b in 0..bins {
+            // Fold bin b into the running prefix.
+            let mut present = 0u64;
+            for f in 0..k {
+                let base = f * bins * c + b * c;
+                let mut add = 0u64;
+                for cl in 0..c {
+                    let v = scratch.hist[base + cl] as u64;
+                    pref[f * c + cl] += v;
+                    add += v;
+                }
+                pref_n[f] += add;
+                present += add;
+            }
+            // The final cut (after the last bin) has an empty right child; and a
+            // cut after an empty bin duplicates the previous one.
+            if b + 1 >= bins || present == 0 {
+                continue;
+            }
+            let mut scores: Vec<f64> = Vec::with_capacity(k);
+            for f in 0..k {
+                let nf = fold_n[f];
+                if nf == 0 {
+                    continue;
+                }
+                let nl = pref_n[f];
+                let nr = nf - nl;
+                if nl == 0 || nr == 0 {
+                    continue;
+                }
+                for cl in 0..c {
+                    let tc = scratch.tot[f * c + cl] as u64;
+                    let lc = pref[f * c + cl];
+                    parent[cl] = tc;
+                    left[cl] = lc;
+                    right[cl] = tc - lc;
+                }
+                let ip = imp_counts(kind, &parent, nf);
+                let il = imp_counts(kind, &left, nl);
+                let ir = imp_counts(kind, &right, nr);
+                let child = (nl as f64 * il + nr as f64 * ir) / nf as f64;
+                scores.push(ip - child);
+            }
+            let stats = FoldStats::from_scores(scores, k);
+            let score = aggregator.aggregate(&stats);
+            out.push(ScoredCandidate {
+                candidate: Candidate {
+                    feature,
+                    state: b as u32,
+                },
+                score,
+                stats,
+            });
+        }
+        return out;
+    }
 
     for b in 0..bins {
         // Skip bins absent from the node entirely.
@@ -212,6 +275,7 @@ pub fn score_regr(
     aggregator: &dyn Aggregator,
     feature: usize,
     scratch: &mut FastScratch,
+    prefix: bool,
 ) -> Vec<ScoredCandidate> {
     let bins = max_bin;
     if bins == 0 || k == 0 {
@@ -253,6 +317,61 @@ pub fn score_regr(
     }
 
     let mut out = Vec::new();
+
+    if prefix {
+        // Threshold sweep with running (n, Σy, Σy²) prefix per fold.
+        let mut pn = vec![0u64; k];
+        let mut psum = vec![0f64; k];
+        let mut psq = vec![0f64; k];
+        for b in 0..bins {
+            let mut present = 0u64;
+            for f in 0..k {
+                let cell = f * bins + b;
+                pn[f] += scratch.ncnt[cell] as u64;
+                psum[f] += scratch.rsum[cell];
+                psq[f] += scratch.rsq[cell];
+                present += scratch.ncnt[cell] as u64;
+            }
+            if b + 1 >= bins || present == 0 {
+                continue;
+            }
+            let mut scores: Vec<f64> = Vec::with_capacity(k);
+            for f in 0..k {
+                let nf = fold_n[f];
+                if nf == 0 {
+                    continue;
+                }
+                let nl = pn[f];
+                let nr = nf - nl;
+                if nl == 0 || nr == 0 {
+                    continue;
+                }
+                let sl = psum[f];
+                let ql = psq[f];
+                let stot = scratch.rtot_sum[f];
+                let qtot = scratch.rtot_sq[f];
+                let sr = stot - sl;
+                let qr = qtot - ql;
+                let ip = variance_from_moments(nf as f64, stot, qtot);
+                let il = variance_from_moments(nl as f64, sl, ql);
+                let ir = variance_from_moments(nr as f64, sr, qr);
+                let child = (nl as f64 * il + nr as f64 * ir) / nf as f64;
+                scores.push(ip - child);
+            }
+            let stats = FoldStats::from_scores(scores, k);
+            let score = aggregator.aggregate(&stats);
+            out.push(ScoredCandidate {
+                candidate: Candidate {
+                    feature,
+                    state: b as u32,
+                },
+                score,
+                stats,
+            });
+        }
+        return out;
+    }
+
     for b in 0..bins {
         let mut present = 0u64;
         for f in 0..k {
@@ -326,6 +445,7 @@ mod tests {
             &Mean,
             0,
             &mut sc,
+            false,
         );
         assert!(out.iter().any(|c| c.stats.n_success > 0 && c.score > 0.0));
     }
@@ -337,7 +457,7 @@ mod tests {
         let order: Vec<SampleId> = (0..8).collect();
         let val_fold: Vec<u8> = vec![0, 0, 0, 0, 1, 1, 1, 1];
         let mut sc = FastScratch::new();
-        let out = score_regr(&codes, &y, &order, &val_fold, 2, 2, &Mean, 0, &mut sc);
+        let out = score_regr(&codes, &y, &order, &val_fold, 2, 2, &Mean, 0, &mut sc, false);
         assert!(out.iter().any(|c| c.stats.n_success > 0 && c.score > 0.0));
     }
 
@@ -360,6 +480,7 @@ mod tests {
             &Mean,
             0,
             &mut sc,
+            false,
         );
         let b = score_classif(
             &codes,
@@ -373,6 +494,7 @@ mod tests {
             &Mean,
             0,
             &mut sc,
+            false,
         );
         assert_eq!(a.len(), b.len());
         for (x, y) in a.iter().zip(b.iter()) {
