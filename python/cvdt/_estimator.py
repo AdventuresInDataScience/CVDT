@@ -102,6 +102,22 @@ class _CVDTBase(BaseEstimator):
     class's ``__init__`` and ignores ``**kwargs``, so each estimator lists every
     parameter explicitly (and stores it verbatim, unmodified) — that is what
     makes ``get_params``/``set_params``/``clone``/``GridSearchCV`` work.
+
+    split_style : {"threshold", "bin"}, default="threshold"
+        How a continuous feature is partitioned at a split (categorical features
+        are always tested by category equality).
+
+        - ``"threshold"`` (default) — a CART-style *ordered* cut: the left child
+          is ``x < edge`` and the right child is everything else, where ``edge``
+          is one of the ``n_bins - 1`` quantile boundaries. This respects the
+          natural ordering of a continuous variable, so the tree can recursively
+          narrow a range; increase ``n_bins`` for finer thresholds.
+        - ``"bin"`` — the original CVDT behaviour: a single quantile bin versus
+          all others (``x in [lo, hi)``). Kept for comparison; ``"bin_membership"``
+          is an accepted alias.
+
+        Both styles are scored by cross-validation on held-out folds, and
+        missing / non-finite values always route to the right child.
     """
 
     # -- shared param validation ------------------------------------------
@@ -112,6 +128,11 @@ class _CVDTBase(BaseEstimator):
             )
         if self.mode not in ("strict", "fast"):
             raise ValueError(f"mode must be 'strict' or 'fast', got {self.mode!r}")
+        if self.split_style not in ("threshold", "bin", "bin_membership"):
+            raise ValueError(
+                "split_style must be 'threshold' (CART-style ordered cut) or "
+                f"'bin' (single quantile bin vs rest), got {self.split_style!r}"
+            )
         if self.n_bins < 2:
             raise ValueError("n_bins must be >= 2")
         if self.cv_folds < 2:
@@ -128,6 +149,7 @@ class _CVDTBase(BaseEstimator):
             cv_seed=int(self.cv_seed),
             cv_shuffle=bool(self.cv_shuffle),
             mode=str(self.mode),
+            split_style=str(self.split_style),
             aggregator=str(self.aggregator),
             agg_frac=float(self.agg_frac),
             agg_eps=float(self.agg_eps),
@@ -225,6 +247,7 @@ class CVDTClassifier(ClassifierMixin, _CVDTBase):
         cv_seed=42,
         cv_shuffle=True,
         mode="strict",
+        split_style="threshold",
         aggregator="mean",
         agg_frac=0.1,
         agg_eps=1e-12,
@@ -248,6 +271,7 @@ class CVDTClassifier(ClassifierMixin, _CVDTBase):
         self.cv_seed = cv_seed
         self.cv_shuffle = cv_shuffle
         self.mode = mode
+        self.split_style = split_style
         self.aggregator = aggregator
         self.agg_frac = agg_frac
         self.agg_eps = agg_eps
@@ -388,6 +412,7 @@ class CVDTRegressor(RegressorMixin, _CVDTBase):
         cv_seed=42,
         cv_shuffle=True,
         mode="strict",
+        split_style="threshold",
         aggregator="mean",
         agg_frac=0.1,
         agg_eps=1e-12,
@@ -407,6 +432,7 @@ class CVDTRegressor(RegressorMixin, _CVDTBase):
         self.cv_seed = cv_seed
         self.cv_shuffle = cv_shuffle
         self.mode = mode
+        self.split_style = split_style
         self.aggregator = aggregator
         self.agg_frac = agg_frac
         self.agg_eps = agg_eps

@@ -282,6 +282,7 @@ pub trait Task: Send + Sync {
         feature: usize,
         aggregator: &dyn Aggregator,
         scratch: &mut FastScratch,
+        prefix: bool,
     ) -> Vec<ScoredCandidate>;
 
     /// Score every candidate `state` of one feature on the **strict** path.
@@ -289,6 +290,7 @@ pub trait Task: Send + Sync {
     /// The default computes impurity gain via [`eval_feature`] and this task's
     /// [`Task::criterion`] — the standard behaviour. Tasks that select splits by
     /// something other than impurity (e.g. an objective metric) override this.
+    #[allow(clippy::too_many_arguments)]
     fn score_feature_strict(
         &self,
         columns: &[Column],
@@ -298,6 +300,7 @@ pub trait Task: Send + Sync {
         folds: &[Fold],
         n_bins: usize,
         aggregator: &dyn Aggregator,
+        prefix: bool,
     ) -> Vec<ScoredCandidate> {
         let states = present_states(&columns[feature], indices, n_bins);
         if states.is_empty() {
@@ -314,6 +317,7 @@ pub trait Task: Send + Sync {
             n_bins,
             self.criterion(),
             1,
+            prefix,
         );
         states
             .iter()
@@ -428,6 +432,7 @@ impl Task for Classification {
         feature: usize,
         aggregator: &dyn Aggregator,
         scratch: &mut FastScratch,
+        prefix: bool,
     ) -> Vec<ScoredCandidate> {
         score_classif(
             codes,
@@ -441,6 +446,7 @@ impl Task for Classification {
             aggregator,
             feature,
             scratch,
+            prefix,
         )
     }
 }
@@ -528,6 +534,7 @@ impl Task for ObjectiveClassification {
         feature: usize,
         aggregator: &dyn Aggregator,
         scratch: &mut FastScratch,
+        prefix: bool,
     ) -> Vec<ScoredCandidate> {
         score_classif_objective(
             codes,
@@ -541,6 +548,7 @@ impl Task for ObjectiveClassification {
             aggregator,
             feature,
             scratch,
+            prefix,
         )
     }
 
@@ -553,6 +561,7 @@ impl Task for ObjectiveClassification {
         folds: &[Fold],
         n_bins: usize,
         aggregator: &dyn Aggregator,
+        prefix: bool,
     ) -> Vec<ScoredCandidate> {
         eval_feature_objective(
             columns,
@@ -564,6 +573,7 @@ impl Task for ObjectiveClassification {
             self.n_classes,
             self.objective.as_ref(),
             aggregator,
+            prefix,
         )
     }
 }
@@ -637,9 +647,10 @@ impl Task for Regression {
         feature: usize,
         aggregator: &dyn Aggregator,
         scratch: &mut FastScratch,
+        prefix: bool,
     ) -> Vec<ScoredCandidate> {
         score_regr(
-            codes, targets, order, val_fold, k, max_bin, aggregator, feature, scratch,
+            codes, targets, order, val_fold, k, max_bin, aggregator, feature, scratch, prefix,
         )
     }
 }
@@ -663,6 +674,19 @@ pub enum SplitMode {
     Fast,
 }
 
+/// How continuous features are partitioned at a split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitStyle {
+    /// CART-style ordered threshold: left child is `x < edge`, right is the rest
+    /// (a contiguous, order-respecting partition). Candidate cuts are the
+    /// quantile bin boundaries; the cross-validated score is still computed on
+    /// held-out folds. This is the default.
+    Threshold,
+    /// One quantile bin vs. all others (`x in [lo, hi)`), the original CVDT
+    /// behaviour. Rarely better for ordered features; kept for comparison.
+    BinMembership,
+}
+
 /// Tree hyper-parameters.
 #[derive(Clone, Debug)]
 pub struct TreeParams {
@@ -680,6 +704,8 @@ pub struct TreeParams {
     pub cv: KFold,
     /// Split-evaluation strategy.
     pub mode: SplitMode,
+    /// How continuous features are partitioned (threshold vs single-bin).
+    pub split_style: SplitStyle,
     /// Whether to evaluate features in parallel.
     pub parallel: bool,
     /// Worker-thread count when `parallel` is set.
@@ -703,6 +729,7 @@ impl Default for TreeParams {
                 shuffle: true,
             },
             mode: SplitMode::Strict,
+            split_style: SplitStyle::Threshold,
             parallel: false,
             n_threads: 1,
             parallel_min_samples: 512,
@@ -723,17 +750,29 @@ fn make_rule(
     state: u32,
     indices: &[usize],
     n_bins: usize,
+    prefix: bool,
 ) -> Option<SplitRule> {
     match col {
         Column::Continuous(v) => {
             let vals: Vec<f64> = indices.iter().map(|&i| v[i]).collect();
             let edges = quantile_edges(&vals, n_bins);
             let (lower, upper) = bin_bounds(&edges, state as usize)?;
-            Some(SplitRule::ContinuousBin {
-                feature,
-                lower,
-                upper,
-            })
+            if prefix {
+                // Threshold split: left child is `x < edge`. The top bin has no
+                // finite upper edge, so a cut there is degenerate.
+                let edge = upper?;
+                Some(SplitRule::ContinuousBin {
+                    feature,
+                    lower: None,
+                    upper: Some(edge),
+                })
+            } else {
+                Some(SplitRule::ContinuousBin {
+                    feature,
+                    lower,
+                    upper,
+                })
+            }
         }
         Column::Categorical(_) => {
             if state == UNKNOWN_CAT {
@@ -785,6 +824,8 @@ fn build_node<K: Task>(
     // Per-feature scoring closure, delegated to the task so alternative
     // strict-path scorers (e.g. objective metrics) plug in transparently.
     let eval_one = |f: &usize| -> Vec<ScoredCandidate> {
+        let prefix = params.split_style == SplitStyle::Threshold
+            && matches!(columns[*f], Column::Continuous(_));
         task.score_feature_strict(
             columns,
             targets,
@@ -793,6 +834,7 @@ fn build_node<K: Task>(
             &folds,
             params.n_bins,
             aggregator,
+            prefix,
         )
     };
 
@@ -821,6 +863,8 @@ fn build_node<K: Task>(
         best.candidate.state,
         indices,
         params.n_bins,
+        params.split_style == SplitStyle::Threshold
+            && matches!(columns[best.candidate.feature], Column::Continuous(_)),
     ) {
         Some(r) => r,
         None => return leaf(prediction),
@@ -875,14 +919,23 @@ fn build_node<K: Task>(
 /// Turn a winning `(feature, bin)` on the fast path into a routing rule using
 /// the global bins. Continuous bins become half-open bounds; categorical dense
 /// ids map back to the original category id.
-fn make_rule_fast(fb: &FeatureBins, feature: usize, state: u32) -> Option<SplitRule> {
+fn make_rule_fast(fb: &FeatureBins, feature: usize, state: u32, prefix: bool) -> Option<SplitRule> {
     if fb.is_continuous {
         let (lower, upper) = fb.cont_bounds(state as usize)?;
-        Some(SplitRule::ContinuousBin {
-            feature,
-            lower,
-            upper,
-        })
+        if prefix {
+            let edge = upper?; // top bin has no finite edge -> degenerate cut
+            Some(SplitRule::ContinuousBin {
+                feature,
+                lower: None,
+                upper: Some(edge),
+            })
+        } else {
+            Some(SplitRule::ContinuousBin {
+                feature,
+                lower,
+                upper,
+            })
+        }
     } else {
         let category = fb.category(state as usize)?;
         Some(SplitRule::Category { feature, category })
@@ -944,6 +997,8 @@ fn build_node_fast<K: Task>(
     let eval_one = |f: &usize| -> Vec<ScoredCandidate> {
         let feature = *f;
         let mut scratch = FastScratch::new();
+        let prefix =
+            params.split_style == SplitStyle::Threshold && binned.bins[feature].is_continuous;
         task.score_feature_fast(
             &binned.codes[feature],
             targets,
@@ -954,6 +1009,7 @@ fn build_node_fast<K: Task>(
             feature,
             aggregator,
             &mut scratch,
+            prefix,
         )
     };
 
@@ -969,6 +1025,8 @@ fn build_node_fast<K: Task>(
             let mut scratch = FastScratch::new();
             let mut all = Vec::new();
             for &feature in &feature_ids {
+                let prefix = params.split_style == SplitStyle::Threshold
+                    && binned.bins[feature].is_continuous;
                 all.extend(task.score_feature_fast(
                     &binned.codes[feature],
                     targets,
@@ -979,6 +1037,7 @@ fn build_node_fast<K: Task>(
                     feature,
                     aggregator,
                     &mut scratch,
+                    prefix,
                 ));
             }
             all
@@ -993,18 +1052,24 @@ fn build_node_fast<K: Task>(
     }
     let feature = best.candidate.feature;
     let state = best.candidate.state;
+    let prefix = params.split_style == SplitStyle::Threshold && binned.bins[feature].is_continuous;
 
-    let rule = match make_rule_fast(&binned.bins[feature], feature, state) {
+    let rule = match make_rule_fast(&binned.bins[feature], feature, state, prefix) {
         Some(r) => r,
         None => return leaf(prediction),
     };
 
-    // Route by global-code equality, which is exactly how the split was scored
-    // (in-bin == matches state), and is consistent with the stored rule's
-    // predict-time bounds.
+    // Route by global code, exactly how the split was scored: prefix (`code <=
+    // state`, i.e. `x < edge`) for threshold splits, equality for single-bin /
+    // categorical. Missing codes (u16::MAX) exceed any state, so they route
+    // right in both cases, consistent with the stored rule.
     let code_state = state as Bin;
     let codes = &binned.codes[feature];
-    let p = partition_in_place(samples, |s| codes[s as usize] == code_state);
+    let p = if prefix {
+        partition_in_place(samples, |s| codes[s as usize] <= code_state)
+    } else {
+        partition_in_place(samples, |s| codes[s as usize] == code_state)
+    };
 
     let min_leaf = params.min_samples_leaf.max(1);
     if p < min_leaf || n - p < min_leaf {

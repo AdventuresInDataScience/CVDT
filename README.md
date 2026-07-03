@@ -12,6 +12,10 @@ not just good on average but *reliably* good across resamples.
 
 - **Better-generalising splits out of the box** — the anti-overfit behaviour is
   baked into split selection, not bolted on via post-hoc pruning.
+- **CART-style ordered splits by default** — continuous features are cut as
+  `x < edge` (`split_style="threshold"`), the geometry classical trees use, but
+  with each cut still scored by cross-validation. The original one-bin-vs-rest
+  behaviour remains available as `split_style="bin"`.
 - **A tunable risk profile** — swap the fold-score aggregator (`mean`,
   `median`, `trimmed_mean`, `signal_to_noise`, `mean - λ·std`, or your own) to
   reward consistency or penalise volatile splits.
@@ -75,19 +79,20 @@ dot = clf.export_graphviz(feature_names=["age", "bmi", "bp"])
 # 3. Raw structure as a dict of parallel arrays, for custom plots or analysis.
 tree = clf.get_tree()
 tree["feature"]         # split feature per node
-tree["lower"], tree["upper"]   # continuous split interval [lo, hi)
+tree["lower"], tree["upper"]   # continuous split bounds (see below)
 tree["children_left"], tree["children_right"]
 tree["is_leaf"], tree["n_samples"], tree["proba"]   # ("value" for regressors)
 
 clf.get_depth(), clf.get_n_leaves()   # sklearn-style size accessors
 ```
 
-One thing to note when reading the output: CVDT splits are **membership tests**,
-not CART-style thresholds. A continuous split routes a sample down the *true*
-branch when its value falls in a half-open interval `[lo, hi)` (shown as a
-one-sided inequality when one end is open); a categorical split routes true when
-the feature equals a specific category. The "true" branch is always the one that
-matches — missing / non-finite values route to "false".
+How a continuous split reads depends on `split_style`. With the default
+**`"threshold"`** (CART-style ordered cut) the *true* branch is `x < upper` —
+`lower` is `-inf`. With **`"bin"`** (the original single-bin behaviour) the true
+branch is the half-open interval `lower <= x < upper` (a one-sided inequality
+when one end is open). A categorical split routes true when the feature equals a
+specific category. The "true" branch is always the one that matches — missing /
+non-finite values route to "false".
 
 ## Architecture
 
@@ -114,17 +119,26 @@ requires.
 
 ## The unified split interface
 
-Every candidate split is a membership test, `feature == state`:
+Candidates are enumerated over quantile bins, `feature == state`, and how a
+continuous `state` is turned into a partition is controlled by `split_style`:
 
 - **Continuous** features are quantile-binned, so `state` is a bin id. The bin
   *edges* are refit on the **training fold only** during cross-validation, which
   is what prevents leakage. There are `E + 1` bins for `E` cut points; a value's
   bin is the number of edges `<= value`.
+  - **`SplitStyle::Threshold`** (default) — a CART-style *ordered* cut: the true
+    branch is `x < edge`, where `edge` is one of the quantile boundaries, so the
+    tree can recursively narrow a range. Candidate cuts are the `E` boundaries;
+    raise `n_bins` for finer resolution.
+  - **`SplitStyle::BinMembership`** — a single quantile bin vs. the rest
+    (`lower <= x < upper`), the original one-vs-rest framing. Kept for comparison.
 - **Categorical** features use their integer category id directly, so `state` is
-  a category id. This is conceptually one-hot without the memory cost.
+  a category id (always tested by equality, independent of `split_style`). This
+  is conceptually one-hot without the memory cost.
 
-Missing / non-finite continuous values and unknown categories never match a
-state, so they route to the "not-in-state" child.
+Both continuous styles are scored the same way — by cross-validation on held-out
+folds. Missing / non-finite continuous values and unknown categories never fall
+in the true branch, so they route to the "not-in-state" / right child.
 
 ## The per-fold score
 
@@ -249,10 +263,13 @@ package are in **[BUILD.md](BUILD.md)**; the Python API reference is in
 
 ## Design decisions and rationale
 
-- **Equality (`feature == state`) split interface**, not thresholds. It unifies
-  continuous and categorical handling behind one abstraction and matches the
-  spec's one-vs-rest framing. Threshold splits are a straightforward future
-  extension (a `SplitRule` already stores bin bounds).
+- **Quantile-bin candidate interface** shared by both split styles. Candidates
+  are enumerated as `feature == state` over quantile bins, and `split_style`
+  decides how a continuous `state` becomes a partition: an ordered CART-style
+  threshold (`x < edge`, the default) or one-bin-vs-rest membership. The single
+  `SplitRule::ContinuousBin { lower, upper }` represents both — a threshold is
+  just the open-lower case — so continuous and categorical handling stay unified
+  behind one abstraction.
 - **Per-fold gain on validation labels, with edges fit on the training fold.**
   This is the crux of the leakage guard: enumeration of candidate states uses
   node-level encoding, but the *score* only ever sees training-fold-derived bin
@@ -321,6 +338,6 @@ PyO3 build, whose macros expand to unsafe).
 
 The remaining documented extensions stay straightforward thanks to the component
 boundaries: additional criteria and aggregators (already trait-based),
-alternative CV strategies, threshold splits, sample weighting, richer
+alternative CV strategies, sample weighting, richer
 missing-value handling, feature importance, pruning, and forest / boosting
 variants.

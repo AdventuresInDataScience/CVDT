@@ -21,7 +21,7 @@ use crate::data::{CatId, Column, FeatureValue, UNKNOWN_CAT};
 use crate::objective::{Accuracy, Average, ClassObjective, FBeta, Precision, Recall, F1};
 use crate::tree::{
     ClassPrediction, Classification, DecisionTree, ExportedNode, Node, ObjectiveClassification,
-    Regression, SplitMode, SplitRule, TreeParams,
+    Regression, SplitMode, SplitRule, SplitStyle, TreeParams,
 };
 
 // Pack a flattened tree into a Python dict of parallel arrays. `with_classes`
@@ -260,6 +260,7 @@ fn build_params(
     cv_seed: u64,
     cv_shuffle: bool,
     mode: &str,
+    split_style: &str,
     parallel: bool,
     n_threads: usize,
     parallel_min_samples: usize,
@@ -270,6 +271,15 @@ fn build_params(
         other => {
             return Err(PyValueError::new_err(format!(
                 "unknown mode {other:?} (expected \"strict\" or \"fast\")"
+            )))
+        }
+    };
+    let split_style = match split_style {
+        "threshold" => SplitStyle::Threshold,
+        "bin" | "bin_membership" => SplitStyle::BinMembership,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown split_style {other:?} (expected \"threshold\" or \"bin\")"
             )))
         }
     };
@@ -285,6 +295,7 @@ fn build_params(
             shuffle: cv_shuffle,
         },
         mode,
+        split_style,
         parallel,
         n_threads,
         parallel_min_samples,
@@ -361,7 +372,7 @@ impl RawClassifier {
     #[pyo3(signature = (
         n_classes, criterion, max_depth, min_samples_split, min_samples_leaf,
         min_impurity_decrease, n_bins, cv_folds, cv_seed, cv_shuffle, mode,
-        aggregator, agg_frac, agg_eps, agg_lambda, parallel, n_threads,
+        split_style, aggregator, agg_frac, agg_eps, agg_lambda, parallel, n_threads,
         parallel_min_samples, categorical
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -377,6 +388,7 @@ impl RawClassifier {
         cv_seed: u64,
         cv_shuffle: bool,
         mode: &str,
+        split_style: &str,
         aggregator: &str,
         agg_frac: f64,
         agg_eps: f64,
@@ -405,6 +417,7 @@ impl RawClassifier {
             cv_seed,
             cv_shuffle,
             mode,
+            split_style,
             parallel,
             n_threads,
             parallel_min_samples,
@@ -532,7 +545,7 @@ impl RawObjectiveClassifier {
     #[pyo3(signature = (
         n_classes, objective, average, pos_label, beta, max_depth,
         min_samples_split, min_samples_leaf, min_impurity_decrease, n_bins,
-        cv_folds, cv_seed, cv_shuffle, mode, aggregator, agg_frac, agg_eps,
+        cv_folds, cv_seed, cv_shuffle, mode, split_style, aggregator, agg_frac, agg_eps,
         agg_lambda, parallel, n_threads, parallel_min_samples, categorical
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -551,6 +564,7 @@ impl RawObjectiveClassifier {
         cv_seed: u64,
         cv_shuffle: bool,
         mode: &str,
+        split_style: &str,
         aggregator: &str,
         agg_frac: f64,
         agg_eps: f64,
@@ -572,6 +586,7 @@ impl RawObjectiveClassifier {
             cv_seed,
             cv_shuffle,
             mode,
+            split_style,
             parallel,
             n_threads,
             parallel_min_samples,
@@ -698,7 +713,7 @@ impl RawRegressor {
     #[pyo3(signature = (
         criterion, max_depth, min_samples_split, min_samples_leaf,
         min_impurity_decrease, n_bins, cv_folds, cv_seed, cv_shuffle, mode,
-        aggregator, agg_frac, agg_eps, agg_lambda, parallel, n_threads,
+        split_style, aggregator, agg_frac, agg_eps, agg_lambda, parallel, n_threads,
         parallel_min_samples, categorical
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -713,6 +728,7 @@ impl RawRegressor {
         cv_seed: u64,
         cv_shuffle: bool,
         mode: &str,
+        split_style: &str,
         aggregator: &str,
         agg_frac: f64,
         agg_eps: f64,
@@ -742,6 +758,7 @@ impl RawRegressor {
             cv_seed,
             cv_shuffle,
             mode,
+            split_style,
             parallel,
             n_threads,
             parallel_min_samples,

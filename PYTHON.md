@@ -80,11 +80,12 @@ Common to both estimators:
 | `min_samples_split` | `2` | Min samples for a node to be splittable. |
 | `min_samples_leaf` | `1` | Min samples each child must receive. |
 | `min_impurity_decrease` | `0.0` | Min aggregated gain to accept a split. |
-| `n_bins` | `8` | Quantile bins for continuous features. |
+| `n_bins` | `8` | Quantile bins for continuous features. With `split_style="threshold"` these boundaries are the candidate cut points, so a larger value gives finer thresholds. |
 | `cv_folds` | `5` | K in the K-fold split evaluation. |
 | `cv_seed` | `42` | Fold-shuffle seed (determinism). |
 | `cv_shuffle` | `True` | Shuffle before folding. |
 | `mode` | `"strict"` | `"strict"` (per-fold edges) or `"fast"` (histogram path). |
+| `split_style` | `"threshold"` | Continuous split geometry: `"threshold"` (CART-style ordered cut, `x < edge`) or `"bin"` (single quantile bin vs rest). Categorical features are always tested by equality. |
 | `aggregator` | `"mean"` | `mean`, `median`, `trimmed_mean`, `signal_to_noise`, `mean_minus_lambda_std`. |
 | `agg_frac` | `0.1` | Trim fraction for `trimmed_mean`. |
 | `agg_eps` | `1e-12` | Stabiliser for `signal_to_noise`. |
@@ -135,9 +136,10 @@ to allow non-improving splits.
     pydot, or dtreeviz).
   - `est.get_tree()` — the tree as a dict of parallel arrays for custom plots.
 
-  Note CVDT splits are membership tests, so continuous branches read as
-  intervals (`lo <= x[f] < hi`) rather than single thresholds, and the "true"
-  branch is the one that matches (missing values route to "false").
+  How continuous branches read depends on `split_style`: with the default
+  `"threshold"` they are single CART-style cuts (`x[f] < edge`), and with
+  `"bin"` they are intervals (`lo <= x[f] < hi`). The "true" branch is the one
+  that matches (missing values route to "false").
 
 - **`categorical_features`** columns are read as integer category ids. Feed
   already-integer-encoded values (e.g. from `OrdinalEncoder`); values are

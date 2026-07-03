@@ -292,6 +292,7 @@ pub fn score_classif_objective(
     aggregator: &dyn Aggregator,
     feature: usize,
     _scratch: &mut FastScratch,
+    prefix: bool,
 ) -> Vec<ScoredCandidate> {
     let bins = max_bin;
     let c = n_classes;
@@ -341,6 +342,87 @@ pub fn score_classif_objective(
     let mut par_train = vec![0u64; c];
     let mut par_val = vec![0u64; c];
     let mut out = Vec::new();
+
+    if prefix {
+        // Threshold sweep: cut after bin b -> left is bins 0..=b. Maintain a
+        // per-fold validation prefix and a node-wide prefix; the training-side
+        // in-state count for fold f is (node-wide prefix) - (fold f prefix),
+        // exactly the subtraction the single-bin path does with hbc/hin.
+        let mut vpref = vec![0u64; k * c]; // cumulative val counts per fold
+        let mut hpref = vec![0u64; c]; // cumulative node-wide counts
+        for b in 0..bins {
+            let mut present = 0u64;
+            for f in 0..k {
+                for cl in 0..c {
+                    let v = hist[f * bins * c + b * c + cl];
+                    vpref[f * c + cl] += v;
+                    hpref[cl] += v;
+                    present += v;
+                }
+            }
+            if b + 1 >= bins || present == 0 {
+                continue;
+            }
+            let mut scores: Vec<f64> = Vec::with_capacity(k);
+            for f in 0..k {
+                let mut nf = 0u64;
+                for cl in 0..c {
+                    nf += tot[f * c + cl];
+                }
+                if nf == 0 {
+                    continue;
+                }
+                let mut nl = 0u64;
+                let mut nr = 0u64;
+                for cl in 0..c {
+                    let hin = vpref[f * c + cl];
+                    let vrest = tot[f * c + cl] - hin;
+                    vc_in[cl] = hin;
+                    vc_rest[cl] = vrest;
+                    nl += hin;
+                    nr += vrest;
+
+                    let ptrain = htot[cl] - tot[f * c + cl];
+                    par_train[cl] = ptrain;
+                    par_val[cl] = tot[f * c + cl];
+                    let tin = hpref[cl] - hin;
+                    tc_in[cl] = tin;
+                    tc_rest[cl] = ptrain - tin;
+                }
+                if nl == 0 || nr == 0 {
+                    continue;
+                }
+                let tin_tot: u64 = tc_in.iter().sum();
+                let trest_tot: u64 = tc_rest.iter().sum();
+                if tin_tot == 0 || trest_tot == 0 {
+                    continue;
+                }
+                let p_in = argmax(&tc_in);
+                let p_rest = argmax(&tc_rest);
+                let p_par = argmax(&par_train);
+
+                let mut split_cm = Confusion::zero(c);
+                split_cm.add_group(p_in, &vc_in);
+                split_cm.add_group(p_rest, &vc_rest);
+
+                let mut par_cm = Confusion::zero(c);
+                par_cm.add_group(p_par, &par_val);
+
+                scores.push(objective.score(&split_cm) - objective.score(&par_cm));
+            }
+            let stats = FoldStats::from_scores(scores, k);
+            let score = aggregator.aggregate(&stats);
+            out.push(ScoredCandidate {
+                candidate: Candidate {
+                    feature,
+                    state: b as u32,
+                },
+                score,
+                stats,
+            });
+        }
+        return out;
+    }
 
     for b in 0..bins {
         // Skip bins with no samples anywhere in the node.
@@ -436,6 +518,7 @@ pub fn eval_feature_objective(
     n_classes: usize,
     objective: &dyn ClassObjective,
     aggregator: &dyn Aggregator,
+    prefix: bool,
 ) -> Vec<ScoredCandidate> {
     let states = present_states(&columns[feature], indices, n_bins);
     if states.is_empty() {
@@ -471,9 +554,16 @@ pub fn eval_feature_objective(
         let par_score = objective.score(&par_cm);
 
         for (si, &state) in states.iter().enumerate() {
+            let in_state = |code: u32| -> bool {
+                if prefix {
+                    code != crate::encoder::MISSING_BIN && code <= state
+                } else {
+                    code == state
+                }
+            };
             let mut tin = vec![0u64; n_classes];
             for (kk, &code) in tcodes.iter().enumerate() {
-                if code == state {
+                if in_state(code) {
                     let t = ttargets[kk];
                     if t < n_classes {
                         tin[t] += 1;
@@ -482,7 +572,7 @@ pub fn eval_feature_objective(
             }
             let mut vin = vec![0u64; n_classes];
             for (kk, &code) in vcodes.iter().enumerate() {
-                if code == state {
+                if in_state(code) {
                     let t = vtargets[kk];
                     if t < n_classes {
                         vin[t] += 1;

@@ -35,27 +35,31 @@ reproduced.
 
 ## Cutting a release
 
-1. Bump the version in **both** files to the same number:
+1. Bump the version to the same number in all three places:
    - `pyproject.toml` → `version = "X.Y.Z"`
    - `Cargo.toml` → `version = "X.Y.Z"`
+   - `python/cvdt/__init__.py` → `__version__ = "X.Y.Z"`
 
-   The `check-version` job fails the release if the tag and these two files
-   disagree, so they must match exactly.
-2. Commit and push to `main`:
+   The `check-version` job fails the release if the tag and `pyproject.toml` /
+   `Cargo.toml` disagree, so those must match exactly. `__init__.py` is not
+   gated by CI but should be kept in step so `cvdt.__version__` is correct.
+2. Add a dated `X.Y.Z` section to [`CHANGELOG.md`](CHANGELOG.md) describing the
+   release (Added / Changed / Fixed), and call out any behaviour changes.
+3. Commit and push to `main`:
    ```sh
-   git add pyproject.toml Cargo.toml
+   git add pyproject.toml Cargo.toml python/cvdt/__init__.py CHANGELOG.md
    git commit -m "Release vX.Y.Z"
    git push
    ```
-3. Tag and push the tag:
+4. Tag and push the tag:
    ```sh
    git tag vX.Y.Z
    git push origin vX.Y.Z
    ```
-4. Watch the run at
+5. Watch the run at
    https://github.com/AdventuresInDataScience/CVDT/actions. If a required
    reviewer is configured, approve the `release` job when it pauses.
-5. Confirm the new version at https://pypi.org/project/cvdt/ and, optionally:
+6. Confirm the new version at https://pypi.org/project/cvdt/ and, optionally:
    ```sh
    pip install --upgrade cvdt
    ```
