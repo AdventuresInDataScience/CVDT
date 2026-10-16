@@ -1,6 +1,6 @@
-# CVDT API Reference (v3)
+# CVDT API Reference
 
-Crate: `cvdt` v0.7.0 · Rust 2021 · MSRV 1.63 · zero dependencies
+Crate: `cvdt` v0.8.0 · Rust 2021 · MSRV 1.63 · zero dependencies
 
 This document describes every public item, organised by module. All listed
 types and functions are re-exported at the crate root, so `use cvdt::Gini;`
@@ -13,6 +13,17 @@ works as well as `use cvdt::criterion::Gini;`.
 > features are now cut as `x < edge` rather than one-bin-vs-rest. Set
 > `split_style: SplitStyle::BinMembership` to recover the v1/v2 semantics.
 > `mode` still defaults to `SplitMode::Strict`.
+>
+> **0.8 changes how splits are scored**, marked *(0.8)*. The default
+> `TreeParams.scoring` is `Scoring::Honest` (training-fit models scored on the
+> held-out fold), which removes the per-candidate upward bias but is not by
+> itself a stopping rule (see `null_permutations`); set
+> `Scoring::InSample` to reproduce 0.7 scores. `FoldStats.std` is now the sample
+> std (`NaN` below two folds), and `eval_feature`, `score_classif`,
+> `score_regr` and the `Task::score_feature_*` methods take a trailing
+> `scoring: Scoring` argument. 0.8 also adds repeated K-fold, a
+> permutation-null stopping test, hierarchical shrinkage, new aggregators, and
+> the "x is present" threshold cut for nodes with missing values.
 
 Convention used below: **Target** is `usize` (class ids) for classification and
 `f64` for regression.
@@ -120,6 +131,14 @@ a trait object.
 ### `trait Criterion: Send + Sync`
 - `type Target: Copy`
 - `fn impurity(&self, targets: &[Self::Target]) -> f64` — empty slice ⇒ `0.0`.
+- `fn supports_heldout(&self) -> bool` *(0.8)* — default `false`; criteria that
+  return `false` fall back to in-sample scoring under `Scoring::Honest`.
+- `fn heldout_loss(&self, train: &[Self::Target], val: &[Self::Target]) ->
+  Option<f64>` *(0.8)* — **total** loss over `val` of the model this criterion
+  fits to `train` (class proportions, mean, or median); `None` when
+  unsupported. With `train == val` it equals `val.len() · impurity` exactly for
+  Gini/Brier, variance/MSE and MAE, and approximately for entropy (log-loss
+  smoothing). `train` must be non-empty.
 - `fn name(&self) -> &'static str`
 
 Object-safe: used as `Box<dyn Criterion<Target = usize>>` /
@@ -146,6 +165,15 @@ single source of truth shared by the exact and fast paths.
 - `fn entropy_from_counts(counts: &[u64], n: u64) -> f64` (bits)
 - `fn variance_from_moments(n: f64, sum: f64, sumsq: f64) -> f64` — `Σx²/n −
   (Σx/n)²`, clamped at 0.
+- `fn brier_loss_counts(train: &[u64], val: &[u64]) -> f64` *(0.8)* — total
+  Brier loss on `val` counts of the class proportions of `train`; `NaN` if
+  `train` is empty.
+- `fn log_loss_counts(train: &[u64], val: &[u64], alpha: f64) -> f64` *(0.8)* —
+  total log-loss (bits) on `val` of the `alpha`-smoothed `train` proportions.
+- `const LOGLOSS_ALPHA: f64 = 0.5` *(0.8)* — Jeffreys smoothing used for
+  held-out log-loss, so a class unseen in training costs a finite amount.
+- `fn sq_loss_moments(n: f64, sum: f64, sumsq: f64, m: f64) -> f64` *(0.8)* —
+  total squared error of predicting `m` for samples with those moments.
 
 ---
 
@@ -162,6 +190,12 @@ Distinct states (bin ids or category ids) occurring in the given samples, sorted
 ascending. Missing bins and unknown categories excluded. For continuous columns,
 node-level quantile edges are fit to enumerate which bins occur.
 
+### `fn split_states(col: &Column, indices: &[usize], n_bins: usize, prefix: bool) -> Vec<u32>` *(0.8)*
+The states the tree actually scores. Same as `present_states`, except for a
+threshold (`prefix = true`) split of a continuous column: the top bin's cut
+("x is present": every present value left, missing right) is kept only when
+the node has missing values. The fast path applies the same rule.
+
 ### `fn generate_candidates(columns: &[Column], indices: &[usize], n_bins: usize) -> Vec<Candidate>`
 All candidates across all features for a node.
 
@@ -175,6 +209,19 @@ Fold generation and per-fold split scoring. Contains no impurity logic.
 Self-contained deterministic PRNG.
 - `SplitMix64::new(seed: u64)`
 - `fn next_u64(&mut self) -> u64`
+- `fn below(&mut self, bound: u64) -> u64` — uniform in `0..bound`.
+
+### `enum Scoring` *(0.8)*
+How a candidate is scored on one fold. Derives `Clone, Copy, Debug, PartialEq,
+Eq`; `Default` is `Honest`.
+- `Scoring::Honest` — parent and child models fit on the training fold, loss
+  (Brier / log-loss / squared / absolute error) measured on the validation fold:
+  `gain = (L_parent − L_left − L_right) / n_val`. A split with no signal scores
+  `≤ 0` in expectation. This removes the per-candidate upward bias; it does not
+  correct for keeping the best of many candidates (see
+  `TreeParams::null_permutations`).
+- `Scoring::InSample` — the ≤ 0.7 score, impurity decrease on the validation
+  labels alone; never negative.
 
 ### `struct Fold`
 - `train: Vec<usize>`, `val: Vec<usize>` (global sample indices).
@@ -194,8 +241,14 @@ Self-contained deterministic PRNG.
 Per-candidate summary across folds.
 - `scores: Vec<f64>` (successful folds only), `mean`, `median`, `std`,
   `n_success: usize`, `n_total: usize`.
-- `mean`/`median` are `-inf` when there are no successful folds; `std` is `0`.
+- `mean`/`median` are `-inf` when there are no successful folds.
+- `std` is the sample std (Bessel-corrected, `n − 1`) *(0.8)*, and `NaN` with
+  fewer than two successful folds, so variance-penalising aggregators score
+  such candidates as non-finite (excluded).
 - `fn from_scores(scores: Vec<f64>, n_total: usize) -> FoldStats`.
+- `fn var(&self) -> f64` *(0.8)* — `std²` (`NaN` when undefined).
+- `fn merged(parts: &[&FoldStats]) -> FoldStats` *(0.8)* — pool several fold
+  sets (repeated K-fold) into one.
 
 ### `fn eval_feature<T: Copy>(...) -> Vec<FoldStats>`
 ```rust
@@ -209,16 +262,20 @@ pub fn eval_feature<T: Copy>(
     criterion: &dyn Criterion<Target = T>,
     min_child: usize,
     prefix: bool,
+    scoring: Scoring,
 ) -> Vec<FoldStats>
 ```
 One `FoldStats` per state (aligned with `states`). For each fold the continuous
-bin edges are fit on the **training** samples only and applied to the
-validation samples (the leakage guard); the per-fold score is the impurity
-decrease on the validation labels,
-`parent - weighted_child`. A fold is skipped for a state when either child has
-fewer than `min_child` validation samples. *(v3)* `prefix = true` scores a
-threshold cut (left child is `code <= state`, i.e. `x < edge`); `false` scores
-single-bin membership (`code == state`).
+bin edges are fit on the **training** samples only and applied to both sides
+(the leakage guard). *(0.8)* With `Scoring::Honest` (when the criterion
+`supports_heldout`) the per-fold score is the honest gain above; a child that is
+empty on the training side predicts with the training parent, and a fold is
+skipped only when its training or validation side is empty (`min_child` is not
+used). With `Scoring::InSample` it is the impurity decrease on the validation
+labels, `parent - weighted_child`, and a fold is skipped for a state when either
+child has fewer than `min_child` validation samples. *(v3)* `prefix = true`
+scores a threshold cut (left child is `code <= state`, i.e. `x < edge`; missing
+codes never go left); `false` scores single-bin membership (`code == state`).
 
 ---
 
@@ -249,7 +306,12 @@ Per-feature metadata.
 
 Histogram-based fast split scoring: one scatter pass builds all K validation-fold
 histograms; each candidate is scored from sufficient statistics with the "rest"
-child obtained by `fold_total − cell`.
+child obtained by `fold_total − cell`. *(0.8)* Under `Scoring::Honest` the
+training side of each fold is `node_total − fold`, so honest scoring needs no
+extra pass. Missing values count toward fold totals but no bin, so they are
+scored in the right child, where they are routed. In a threshold sweep the cut
+after the last bin ("x is present") is offered only when the node has missing
+values.
 
 ### `enum ClassImpurityKind`
 `Gini` | `Entropy` — which impurity to compute from class counts. Derives
@@ -266,10 +328,11 @@ pub fn score_classif(
     order: &[SampleId], val_fold: &[u8], k: usize,
     max_bin: usize, n_classes: usize, kind: ClassImpurityKind,
     aggregator: &dyn Aggregator, feature: usize, scratch: &mut FastScratch,
-    prefix: bool,
+    prefix: bool, scoring: Scoring,
 ) -> Vec<ScoredCandidate>
 ```
-One `ScoredCandidate` per candidate cut, scored by CV gain on validation labels.
+One `ScoredCandidate` per candidate cut, scored by CV gain on validation labels
+(honest Brier / log-loss gain, or in-sample impurity decrease, per `scoring`).
 *(v3)* `prefix = true` sweeps threshold cuts (left child is bins `0..=state`, via
 a running per-fold class prefix); `false` scores single-bin membership
 (`feature == bin`).
@@ -281,10 +344,14 @@ pub fn score_regr(
     order: &[SampleId], val_fold: &[u8], k: usize,
     max_bin: usize, aggregator: &dyn Aggregator,
     feature: usize, scratch: &mut FastScratch,
-    prefix: bool,
+    prefix: bool, scoring: Scoring,
 ) -> Vec<ScoredCandidate>
 ```
 Variance/MSE via `(count, Σy, Σy²)` moments. (MAE is unsupported on this path.)
+*(0.8)* Moments are accumulated for `y − c`, with `c` the mean of up to 64
+(shuffled) node samples; gains are shift-invariant, and the shift avoids
+catastrophic cancellation when targets have a large offset relative to their
+spread.
 *(v3)* `prefix` selects threshold-sweep vs single-bin as in `score_classif`.
 
 ---
@@ -295,9 +362,16 @@ Collapse `FoldStats` into one ranking number where **higher is better**.
 
 ### `trait Aggregator: Send + Sync`
 - `fn aggregate(&self, stats: &FoldStats) -> f64`
+- `fn aggregate_node(&self, stats: &[&FoldStats]) -> Vec<f64>` *(0.8)* — score
+  every candidate of one node at once (lets aggregators pool information across
+  candidates). Default: `aggregate` per candidate. The tree calls this after all
+  candidates (and all `cv_repeats`) are scored.
 - `fn name(&self) -> &'static str`
 
 Implementations must return `f64::NEG_INFINITY` when `stats.n_success == 0`.
+Fold scores share training data and are correlated, so `std` describes
+fold-to-fold spread but understates the uncertainty of the mean; no aggregator
+here is a calibrated confidence bound.
 
 ### Provided aggregators
 - `struct Mean` — arithmetic mean (`Default`).
@@ -306,6 +380,15 @@ Implementations must return `f64::NEG_INFINITY` when `stats.n_success == 0`.
 - `struct SignalToNoise { pub eps: f64 }` — `mean / (std + eps)`; `Default` uses
   `eps = 1e-12`.
 - `struct MeanMinusLambdaStd { pub lambda: f64 }` — `mean - λ·std`.
+- `struct Quantile { pub q: f64 }` *(0.8)* — linear-interpolated `q`-quantile of
+  the fold scores (risk-averse for small `q`).
+- `struct ModeratedSignalToNoise { pub d0: f64, pub eps: f64 }` *(0.8)* —
+  `mean / sqrt(moderated var)`, where each candidate's variance is shrunk toward
+  the node's median candidate variance with weight `d0` fold-equivalents
+  (limma-style): `(d0·s0² + (n−1)·s²) / (d0 + n − 1)`. `Default`: `d0 = 4`,
+  `eps = 1e-12`.
+- `struct ModeratedMeanMinusLambdaStd { pub lambda: f64, pub d0: f64 }` *(0.8)*
+  — `mean − λ·sqrt(moderated var)`.
 - `struct Custom { pub f: Box<dyn Fn(&FoldStats) -> f64 + Send + Sync> }` ·
   `Custom::new(closure)`.
 
@@ -347,6 +430,8 @@ Orchestration, tasks, hyper-parameters and prediction.
 Routing rule stored in an internal node. "Left" means *matches the state*;
 missing / non-finite values route right.
 - `SplitRule::ContinuousBin { feature: usize, lower: Option<f64>, upper: Option<f64> }`
+  — `lower <= x < upper`, `None` = open end. With both bounds `None` it is the
+  "x is present" rule *(0.8)*: every finite value left, missing right.
 - `SplitRule::Category { feature: usize, category: u32 }`
 - `fn feature(&self) -> usize`
 - `fn route_left_train(&self, columns: &[Column], i: usize) -> bool`
@@ -384,15 +469,22 @@ Derives `Clone, Copy, Debug, PartialEq, Eq`.
   with no additive statistic (MAE).
 - `fn score_feature_fast(&self, codes: &[Bin], targets: &[Self::Target], order:
   &[SampleId], val_fold: &[u8], k: usize, max_bin: usize, feature: usize,
-  aggregator: &dyn Aggregator, scratch: &mut FastScratch, prefix: bool) ->
-  Vec<ScoredCandidate>` *(v2; `prefix` added v3)* — fast-path scorer for one
-  feature; implementations delegate to `histogram`. `prefix = true` scores
-  CART-style threshold cuts (`code <= state`), `false` single-bin membership.
+  aggregator: &dyn Aggregator, scratch: &mut FastScratch, prefix: bool,
+  scoring: Scoring) -> Vec<ScoredCandidate>` *(v2; `prefix` added v3, `scoring`
+  added 0.8)* — fast-path scorer for one feature; implementations delegate to
+  `histogram`. `prefix = true` scores CART-style threshold cuts
+  (`code <= state`), `false` single-bin membership.
 - `fn score_feature_strict(&self, columns: &[Column], targets: &[Self::Target],
   feature: usize, indices: &[usize], folds: &[Fold], n_bins: usize, aggregator:
-  &dyn Aggregator, prefix: bool) -> Vec<ScoredCandidate>` — strict-path scorer
-  (default delegates to `eval_feature`); `prefix` selects threshold vs single-bin
-  as above.
+  &dyn Aggregator, prefix: bool, scoring: Scoring) -> Vec<ScoredCandidate>` —
+  strict-path scorer (default: `split_states` + `eval_feature`); `prefix`
+  selects threshold vs single-bin as above.
+- `fn shrink(&self, parent_shrunk: &Self::Prediction, parent_raw:
+  &Self::Prediction, raw: &Self::Prediction, parent_n: usize, lambda: f64) ->
+  Self::Prediction` *(0.8)* — hierarchical-shrinkage step
+  `shrunk_parent + (raw − raw_parent) / (1 + λ / n_parent)`; default returns
+  `raw` unchanged. Classification shrinks the probability vector and recomputes
+  the argmax class; regression shrinks the mean.
 
 ### `struct ClassPrediction`
 - `class: usize` (argmax; lowest id on ties), `proba: Vec<f64>` (per-class
@@ -416,7 +508,7 @@ Derives `Clone, Copy, Debug, PartialEq, Eq`.
 |---|---|---|---|
 | `max_depth` | `Option<usize>` | `Some(8)` | max split levels; `None` = unlimited |
 | `min_samples_split` | `usize` | `2` | min samples for a node to be eligible to split |
-| `min_samples_leaf` | `usize` | `1` | min samples each child must receive |
+| `min_samples_leaf` | `usize` | `30` | min samples each child must receive; candidates violating it are excluded before selection *(0.8: default was 1, and only the winner was checked)* |
 | `min_impurity_decrease` | `f64` | `0.0` | winning score must strictly exceed this |
 | `n_bins` | `usize` | `8` | quantile bins for continuous features |
 | `cv` | `KFold` | `KFold{k:5,seed:42,shuffle:true}` | CV configuration |
@@ -425,6 +517,12 @@ Derives `Clone, Copy, Debug, PartialEq, Eq`.
 | `parallel` | `bool` | `false` | evaluate features in parallel |
 | `n_threads` | `usize` | `1` | worker threads when `parallel` |
 | `parallel_min_samples` | `usize` | `512` | *(v2)* min node size to parallelise |
+| `scoring` | `Scoring` | `Honest` | *(0.8)* per-fold score; see `Scoring` |
+| `cv_repeats` | `usize` | `1` | *(0.8)* repeated K-fold rounds per node; scores pooled per candidate |
+| `min_valid_folds` | `usize` | `2` | *(0.8)* candidates scoring on fewer folds (capped at the number attempted) are discarded |
+| `null_permutations` | `usize` | `0` | *(0.8)* permutation-null stopping test; `0` = off |
+| `null_quantile` | `f64` | `0.95` | *(0.8)* quantile of the permuted best scores the real best must exceed |
+| `shrinkage` | `f64` | `0.0` | *(0.8)* hierarchical-shrinkage λ for leaf predictions; `0` = off |
 
 Implements `Default` and `Clone`.
 
@@ -462,7 +560,20 @@ Convenience constructors (default params + `Mean` aggregator):
 - **Parallel = serial:** `predict` output and tree shape are independent of
   `parallel` / `n_threads`.
 - **Split acceptance:** a node becomes a leaf when it is pure, hits a stopping
-  criterion, has no candidate with a finite score, the best aggregated score is
-  `<= min_impurity_decrease`, or a child would fall below `min_samples_leaf`.
+  criterion, has no candidate with a finite score (candidates below
+  `min_valid_folds` count as non-finite), the best aggregated score is
+  `<= min_impurity_decrease`, the best score does not beat the permutation null
+  (when `null_permutations > 0`). *(0.8)* Candidates that would leave a child
+  below `min_samples_leaf` are dropped before selection, and a node with fewer
+  than `2 · min_samples_leaf` samples is not scored at all.
+- **Stopping on noise:** *(0.8)* honest scoring makes each noise split score
+  `≤ 0` in expectation, but the best of many candidates is usually positive, so
+  `min_impurity_decrease = 0` alone still lets noise split, most of all at
+  small nodes. The permutation null accounts for the search; `min_samples_leaf`
+  also helps.
 - **Missing values:** non-finite continuous values and unknown categories never
-  match a split state and therefore route to the right child.
+  match a split state and therefore route to the right child. *(0.8)* With
+  threshold splits, a node with missing values can also split on "x is present",
+  so informative missingness is usable on both paths.
+- **Shrinkage:** *(0.8)* changes leaf predictions only; tree structure is
+  identical with and without it.

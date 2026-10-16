@@ -15,8 +15,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::aggregation::{
-    Aggregator, Mean, MeanMinusLambdaStd, Median, SignalToNoise, TrimmedMean,
+    Aggregator, Mean, MeanMinusLambdaStd, Median, ModeratedMeanMinusLambdaStd,
+    ModeratedSignalToNoise, Quantile, SignalToNoise, TrimmedMean,
 };
+use crate::cross_validation::Scoring;
 use crate::data::{CatId, Column, FeatureValue, UNKNOWN_CAT};
 use crate::objective::{Accuracy, Average, ClassObjective, FBeta, Precision, Recall, F1};
 use crate::tree::{
@@ -299,16 +301,78 @@ fn build_params(
         parallel,
         n_threads,
         parallel_min_samples,
+        ..TreeParams::default()
     })
 }
 
-fn build_aggregator(name: &str, frac: f64, eps: f64, lambda: f64) -> PyResult<Box<dyn Aggregator>> {
+/// Read an optional key from the `extra` options dict (`None` / missing /
+/// Python `None` all mean "use the default").
+fn extra_get<'py, T: FromPyObject<'py>>(
+    extra: Option<&Bound<'py, PyDict>>,
+    key: &str,
+) -> PyResult<Option<T>> {
+    let d = match extra {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    match d.get_item(key)? {
+        Some(v) if !v.is_none() => Ok(Some(v.extract()?)),
+        _ => Ok(None),
+    }
+}
+
+/// Apply the v0.8 options carried in `extra` (scoring, repeats, null test,
+/// shrinkage, ...) on top of the positional parameters.
+fn apply_extra(params: &mut TreeParams, extra: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+    if let Some(sc) = extra_get::<String>(extra, "scoring")? {
+        params.scoring = match sc.as_str() {
+            "honest" => Scoring::Honest,
+            "in_sample" | "insample" => Scoring::InSample,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown scoring {other:?} (expected \"honest\" or \"in_sample\")"
+                )))
+            }
+        };
+    }
+    if let Some(v) = extra_get::<usize>(extra, "cv_repeats")? {
+        params.cv_repeats = v.max(1);
+    }
+    if let Some(v) = extra_get::<usize>(extra, "min_valid_folds")? {
+        params.min_valid_folds = v;
+    }
+    if let Some(v) = extra_get::<usize>(extra, "null_permutations")? {
+        params.null_permutations = v;
+    }
+    if let Some(v) = extra_get::<f64>(extra, "null_quantile")? {
+        params.null_quantile = v;
+    }
+    if let Some(v) = extra_get::<f64>(extra, "shrinkage")? {
+        params.shrinkage = v;
+    }
+    Ok(())
+}
+
+fn build_aggregator(
+    name: &str,
+    frac: f64,
+    eps: f64,
+    lambda: f64,
+    extra: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Box<dyn Aggregator>> {
+    let q = extra_get::<f64>(extra, "agg_q")?.unwrap_or(0.25);
+    let d0 = extra_get::<f64>(extra, "agg_d0")?.unwrap_or(4.0);
     Ok(match name {
         "mean" => Box::new(Mean),
         "median" => Box::new(Median),
         "trimmed_mean" => Box::new(TrimmedMean { frac }),
         "signal_to_noise" => Box::new(SignalToNoise { eps }),
         "mean_minus_lambda_std" => Box::new(MeanMinusLambdaStd { lambda }),
+        "quantile" => Box::new(Quantile { q }),
+        "moderated_signal_to_noise" => Box::new(ModeratedSignalToNoise { d0, eps }),
+        "moderated_mean_minus_lambda_std" => {
+            Box::new(ModeratedMeanMinusLambdaStd { lambda, d0 })
+        }
         other => {
             return Err(PyValueError::new_err(format!(
                 "unknown aggregator {other:?}"
@@ -373,7 +437,7 @@ impl RawClassifier {
         n_classes, criterion, max_depth, min_samples_split, min_samples_leaf,
         min_impurity_decrease, n_bins, cv_folds, cv_seed, cv_shuffle, mode,
         split_style, aggregator, agg_frac, agg_eps, agg_lambda, parallel, n_threads,
-        parallel_min_samples, categorical
+        parallel_min_samples, categorical, extra=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -397,6 +461,7 @@ impl RawClassifier {
         n_threads: usize,
         parallel_min_samples: usize,
         categorical: Vec<usize>,
+        extra: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let task = match criterion {
             "gini" => Classification::gini(n_classes),
@@ -407,7 +472,7 @@ impl RawClassifier {
                 )))
             }
         };
-        let params = build_params(
+        let mut params = build_params(
             max_depth,
             min_samples_split,
             min_samples_leaf,
@@ -422,7 +487,8 @@ impl RawClassifier {
             n_threads,
             parallel_min_samples,
         )?;
-        let agg = build_aggregator(aggregator, agg_frac, agg_eps, agg_lambda)?;
+        apply_extra(&mut params, extra)?;
+        let agg = build_aggregator(aggregator, agg_frac, agg_eps, agg_lambda, extra)?;
         let mut categorical = categorical;
         categorical.sort_unstable();
         categorical.dedup();
@@ -546,7 +612,7 @@ impl RawObjectiveClassifier {
         n_classes, objective, average, pos_label, beta, max_depth,
         min_samples_split, min_samples_leaf, min_impurity_decrease, n_bins,
         cv_folds, cv_seed, cv_shuffle, mode, split_style, aggregator, agg_frac, agg_eps,
-        agg_lambda, parallel, n_threads, parallel_min_samples, categorical
+        agg_lambda, parallel, n_threads, parallel_min_samples, categorical, extra=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -573,10 +639,11 @@ impl RawObjectiveClassifier {
         n_threads: usize,
         parallel_min_samples: usize,
         categorical: Vec<usize>,
+        extra: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let obj = build_objective(objective, average, pos_label, beta)?;
         let task = ObjectiveClassification::new(n_classes, obj);
-        let params = build_params(
+        let mut params = build_params(
             max_depth,
             min_samples_split,
             min_samples_leaf,
@@ -591,7 +658,8 @@ impl RawObjectiveClassifier {
             n_threads,
             parallel_min_samples,
         )?;
-        let agg = build_aggregator(aggregator, agg_frac, agg_eps, agg_lambda)?;
+        apply_extra(&mut params, extra)?;
+        let agg = build_aggregator(aggregator, agg_frac, agg_eps, agg_lambda, extra)?;
         let mut categorical = categorical;
         categorical.sort_unstable();
         categorical.dedup();
@@ -714,7 +782,7 @@ impl RawRegressor {
         criterion, max_depth, min_samples_split, min_samples_leaf,
         min_impurity_decrease, n_bins, cv_folds, cv_seed, cv_shuffle, mode,
         split_style, aggregator, agg_frac, agg_eps, agg_lambda, parallel, n_threads,
-        parallel_min_samples, categorical
+        parallel_min_samples, categorical, extra=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -737,6 +805,7 @@ impl RawRegressor {
         n_threads: usize,
         parallel_min_samples: usize,
         categorical: Vec<usize>,
+        extra: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let task = match criterion {
             "mse" => Regression::mse(),
@@ -748,7 +817,7 @@ impl RawRegressor {
                 )))
             }
         };
-        let params = build_params(
+        let mut params = build_params(
             max_depth,
             min_samples_split,
             min_samples_leaf,
@@ -763,7 +832,8 @@ impl RawRegressor {
             n_threads,
             parallel_min_samples,
         )?;
-        let agg = build_aggregator(aggregator, agg_frac, agg_eps, agg_lambda)?;
+        apply_extra(&mut params, extra)?;
+        let agg = build_aggregator(aggregator, agg_frac, agg_eps, agg_lambda, extra)?;
         let mut categorical = categorical;
         categorical.sort_unstable();
         categorical.dedup();

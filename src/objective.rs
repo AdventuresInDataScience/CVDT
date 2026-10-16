@@ -34,7 +34,7 @@
 //! `min_impurity_decrease` below 0 if you want to allow non-improving splits.
 
 use crate::aggregation::Aggregator;
-use crate::candidate::{present_states, Candidate};
+use crate::candidate::{split_states, Candidate};
 use crate::cross_validation::{fold_train_val_codes, Fold, FoldStats};
 use crate::data::{Bin, Column, SampleId, MISSING_BIN_CODE};
 use crate::histogram::FastScratch;
@@ -303,21 +303,26 @@ pub fn score_classif_objective(
     // Single scatter pass: per-fold validation class histograms.
     let mut hist = vec![0u64; k * bins * c]; // hist[f][b][cl]
     let mut tot = vec![0u64; k * c]; // per (fold, class) validation totals
+    // Missing values count toward the fold totals but no bin, so the "rest"
+    // child (`tot − in`) contains them, matching how they are routed.
+    let mut n_missing = 0u64;
     for (pos, &sid) in order.iter().enumerate() {
         let s = sid as usize;
+        let lab = labels[s];
+        if lab >= c {
+            continue;
+        }
+        let f = val_fold[pos] as usize;
         let b = codes[s];
         if b == MISSING_BIN_CODE {
+            tot[f * c + lab] += 1;
+            n_missing += 1;
             continue;
         }
         let b = b as usize;
         if b >= bins {
             continue;
         }
-        let lab = labels[s];
-        if lab >= c {
-            continue;
-        }
-        let f = val_fold[pos] as usize;
         hist[f * bins * c + b * c + lab] += 1;
         tot[f * c + lab] += 1;
     }
@@ -328,10 +333,12 @@ pub fn score_classif_objective(
     for f in 0..k {
         for b in 0..bins {
             for cl in 0..c {
-                let v = hist[f * bins * c + b * c + cl];
-                hbc[b * c + cl] += v;
-                htot[cl] += v;
+                hbc[b * c + cl] += hist[f * bins * c + b * c + cl];
             }
+        }
+        // From `tot`, not `hist`, so missing samples are included.
+        for cl in 0..c {
+            htot[cl] += tot[f * c + cl];
         }
     }
 
@@ -360,7 +367,9 @@ pub fn score_classif_objective(
                     present += v;
                 }
             }
-            if b + 1 >= bins || present == 0 {
+            // The cut after the last bin is "x is present"; it is a real split
+            // only when the node has missing values (see `score_classif`).
+            if present == 0 || (b + 1 >= bins && n_missing == 0) {
                 continue;
             }
             let mut scores: Vec<f64> = Vec::with_capacity(k);
@@ -520,7 +529,7 @@ pub fn eval_feature_objective(
     aggregator: &dyn Aggregator,
     prefix: bool,
 ) -> Vec<ScoredCandidate> {
-    let states = present_states(&columns[feature], indices, n_bins);
+    let states = split_states(&columns[feature], indices, n_bins, prefix);
     if states.is_empty() {
         return Vec::new();
     }

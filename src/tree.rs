@@ -12,13 +12,13 @@
 //! works for any task. This is the Rust-idiomatic rendering of the
 //! `DecisionTreeBase -> {Classifier, Regressor}` design.
 
-use crate::aggregation::{Aggregator, Mean};
+use crate::aggregation::{quantile_of, Aggregator, Mean};
 use crate::binning::{BinnedData, FeatureBins};
-use crate::candidate::{present_states, Candidate};
+use crate::candidate::{split_states, Candidate};
 use crate::criterion::{Criterion, Entropy, Gini, Mae, Mse, Variance};
-use crate::cross_validation::{eval_feature, Fold, KFold};
+use crate::cross_validation::{eval_feature, Fold, FoldStats, KFold, Scoring, SplitMix64};
 use crate::data::{Bin, Column, FeatureValue, SampleId, UNKNOWN_CAT};
-use crate::encoder::{bin_bounds, quantile_edges};
+use crate::encoder::{bin_bounds, bin_of, quantile_edges};
 use crate::histogram::{score_classif, score_regr, ClassImpurityKind, FastScratch};
 use crate::objective::{
     eval_feature_objective, score_classif_objective, Accuracy, Average, ClassObjective, FBeta,
@@ -39,7 +39,9 @@ use crate::selector::{select_best, ScoredCandidate};
 #[derive(Clone, Debug, PartialEq)]
 pub enum SplitRule {
     /// Continuous feature falls in the half-open bin: lower inclusive, upper exclusive.
-    /// `None` bounds are open ends (`-inf` / `+inf`).
+    /// `None` bounds are open ends (`-inf` / `+inf`). With both bounds open the
+    /// rule is "x is present": every finite value routes left and missing /
+    /// non-finite values route right (the threshold sweep's top-bin cut).
     ContinuousBin {
         /// Feature index.
         feature: usize,
@@ -283,6 +285,7 @@ pub trait Task: Send + Sync {
         aggregator: &dyn Aggregator,
         scratch: &mut FastScratch,
         prefix: bool,
+        scoring: Scoring,
     ) -> Vec<ScoredCandidate>;
 
     /// Score every candidate `state` of one feature on the **strict** path.
@@ -301,13 +304,15 @@ pub trait Task: Send + Sync {
         n_bins: usize,
         aggregator: &dyn Aggregator,
         prefix: bool,
+        scoring: Scoring,
     ) -> Vec<ScoredCandidate> {
-        let states = present_states(&columns[feature], indices, n_bins);
+        let states = split_states(&columns[feature], indices, n_bins, prefix);
         if states.is_empty() {
             return Vec::new();
         }
-        // min_child = 1 here; real min_samples_leaf is enforced on the actual
-        // node partition, not per-fold.
+        // min_child = 1 here; min_samples_leaf applies to the node-level
+        // partition and is enforced by the tree (`retain_admissible`), not
+        // per fold.
         let stats = eval_feature(
             columns,
             targets,
@@ -318,6 +323,7 @@ pub trait Task: Send + Sync {
             self.criterion(),
             1,
             prefix,
+            scoring,
         );
         states
             .iter()
@@ -332,6 +338,65 @@ pub trait Task: Send + Sync {
             })
             .collect()
     }
+
+    /// Hierarchical shrinkage step (Agarwal et al., 2022): the shrunk
+    /// prediction of a child given its parent's shrunk and raw predictions,
+    ///
+    /// `shrunk_child = shrunk_parent + (raw_child − raw_parent) / (1 + λ / n_parent)`.
+    ///
+    /// Applied root-to-leaf, a deep split on few samples only nudges the
+    /// prediction instead of committing to it. The default returns `raw`
+    /// unchanged (no shrinkage).
+    fn shrink(
+        &self,
+        parent_shrunk: &Self::Prediction,
+        parent_raw: &Self::Prediction,
+        raw: &Self::Prediction,
+        parent_n: usize,
+        lambda: f64,
+    ) -> Self::Prediction {
+        let _ = (parent_shrunk, parent_raw, parent_n, lambda);
+        raw.clone()
+    }
+}
+
+/// Shrink class probabilities (see [`Task::shrink`]); clamps at zero,
+/// renormalises and recomputes the argmax class (lowest id on ties).
+fn shrink_class(
+    parent_shrunk: &ClassPrediction,
+    parent_raw: &ClassPrediction,
+    raw: &ClassPrediction,
+    parent_n: usize,
+    lambda: f64,
+) -> ClassPrediction {
+    let w = 1.0 / (1.0 + lambda / parent_n.max(1) as f64);
+    let mut proba: Vec<f64> = raw
+        .proba
+        .iter()
+        .enumerate()
+        .map(|(j, &p)| {
+            let ps = parent_shrunk.proba.get(j).copied().unwrap_or(0.0);
+            let pr = parent_raw.proba.get(j).copied().unwrap_or(0.0);
+            (ps + w * (p - pr)).max(0.0)
+        })
+        .collect();
+    let total: f64 = proba.iter().sum();
+    if total > 0.0 {
+        for p in proba.iter_mut() {
+            *p /= total;
+        }
+    } else {
+        proba = parent_shrunk.proba.clone();
+    }
+    let mut class = 0usize;
+    let mut best = f64::NEG_INFINITY;
+    for (i, &p) in proba.iter().enumerate() {
+        if p > best {
+            best = p;
+            class = i;
+        }
+    }
+    ClassPrediction { class, proba }
 }
 
 /// Prediction returned by a classifier: the chosen class and the class
@@ -433,6 +498,7 @@ impl Task for Classification {
         aggregator: &dyn Aggregator,
         scratch: &mut FastScratch,
         prefix: bool,
+        scoring: Scoring,
     ) -> Vec<ScoredCandidate> {
         score_classif(
             codes,
@@ -447,7 +513,19 @@ impl Task for Classification {
             feature,
             scratch,
             prefix,
+            scoring,
         )
+    }
+
+    fn shrink(
+        &self,
+        parent_shrunk: &ClassPrediction,
+        parent_raw: &ClassPrediction,
+        raw: &ClassPrediction,
+        parent_n: usize,
+        lambda: f64,
+    ) -> ClassPrediction {
+        shrink_class(parent_shrunk, parent_raw, raw, parent_n, lambda)
     }
 }
 
@@ -535,7 +613,10 @@ impl Task for ObjectiveClassification {
         aggregator: &dyn Aggregator,
         scratch: &mut FastScratch,
         prefix: bool,
+        _scoring: Scoring,
     ) -> Vec<ScoredCandidate> {
+        // Objective scoring is already honest: child classes are assigned
+        // from training-fold counts and the metric is measured on validation.
         score_classif_objective(
             codes,
             targets,
@@ -562,6 +643,7 @@ impl Task for ObjectiveClassification {
         n_bins: usize,
         aggregator: &dyn Aggregator,
         prefix: bool,
+        _scoring: Scoring,
     ) -> Vec<ScoredCandidate> {
         eval_feature_objective(
             columns,
@@ -575,6 +657,17 @@ impl Task for ObjectiveClassification {
             aggregator,
             prefix,
         )
+    }
+
+    fn shrink(
+        &self,
+        parent_shrunk: &ClassPrediction,
+        parent_raw: &ClassPrediction,
+        raw: &ClassPrediction,
+        parent_n: usize,
+        lambda: f64,
+    ) -> ClassPrediction {
+        shrink_class(parent_shrunk, parent_raw, raw, parent_n, lambda)
     }
 }
 
@@ -648,10 +741,24 @@ impl Task for Regression {
         aggregator: &dyn Aggregator,
         scratch: &mut FastScratch,
         prefix: bool,
+        scoring: Scoring,
     ) -> Vec<ScoredCandidate> {
         score_regr(
             codes, targets, order, val_fold, k, max_bin, aggregator, feature, scratch, prefix,
+            scoring,
         )
+    }
+
+    fn shrink(
+        &self,
+        parent_shrunk: &f64,
+        parent_raw: &f64,
+        raw: &f64,
+        parent_n: usize,
+        lambda: f64,
+    ) -> f64 {
+        let w = 1.0 / (1.0 + lambda / parent_n.max(1) as f64);
+        parent_shrunk + w * (raw - parent_raw)
     }
 }
 
@@ -694,7 +801,12 @@ pub struct TreeParams {
     pub max_depth: Option<usize>,
     /// Minimum samples a node must have to be eligible to split.
     pub min_samples_split: usize,
-    /// Minimum samples each child must receive for a split to be accepted.
+    /// Minimum samples each child must receive. Candidates that would leave a
+    /// smaller child are excluded before the best split is chosen, so this
+    /// restricts *which* split is taken rather than vetoing the winner.
+    /// Defaults to 30 (the usual n ≥ 30 rule of thumb for a stable mean or
+    /// proportion), which also stops honest scoring from chasing noise at
+    /// tiny nodes; lower it for small datasets.
     pub min_samples_leaf: usize,
     /// Minimum aggregated score for a split to be accepted (must be exceeded).
     pub min_impurity_decrease: f64,
@@ -713,6 +825,40 @@ pub struct TreeParams {
     /// Only parallelise nodes with at least this many samples (spawning threads
     /// for tiny nodes costs more than it saves).
     pub parallel_min_samples: usize,
+    /// How a candidate is scored on a fold. [`Scoring::Honest`] (default)
+    /// measures training-fit loss on held-out data, so a split with no signal
+    /// scores `≤ 0` in expectation. The *best* of many such candidates is
+    /// still usually positive, so on its own this does not stop noise splits
+    /// (least of all at small nodes); combine with `null_permutations` and/or
+    /// `min_samples_leaf` for that.
+    /// [`Scoring::InSample`] reproduces ≤ 0.7 behaviour.
+    pub scoring: Scoring,
+    /// Number of independently shuffled K-fold rounds per node (repeated
+    /// K-fold). Each candidate's fold scores are pooled across rounds, giving
+    /// `k · cv_repeats` scores and a more stable spread estimate for
+    /// variance-aware aggregators (repeats reuse the same samples, so the
+    /// pooled scores are correlated, not independent). `1` = plain K-fold.
+    /// Cost scales linearly.
+    pub cv_repeats: usize,
+    /// A candidate must produce a valid score on at least this many folds
+    /// (capped at the number attempted) or it is discarded.
+    pub min_valid_folds: usize,
+    /// Permutation-null stopping test: if `> 0`, the node's targets are
+    /// permuted this many times, every candidate is rescored, and the split
+    /// is accepted only if the real best score exceeds the `null_quantile`
+    /// quantile of the permuted best scores. Adapts automatically to node
+    /// size and to how many candidates were searched (the max over candidates
+    /// is what overfits), which makes it the stopping rule that accounts for
+    /// the search; 19 permutations with `null_quantile = 0.95` is a reasonable
+    /// start. `0` = off. Costs `null_permutations` extra node scorings (only at
+    /// nodes whose best score already passes `min_impurity_decrease`) plus an
+    /// O(n_total) target copy each.
+    pub null_permutations: usize,
+    /// Quantile of the permutation null the best score must beat (e.g. 0.95).
+    pub null_quantile: f64,
+    /// Hierarchical-shrinkage strength λ (Agarwal et al., 2022) applied to
+    /// leaf predictions; `0` = off. Typical values 1–100, tune by CV.
+    pub shrinkage: f64,
 }
 
 impl Default for TreeParams {
@@ -720,7 +866,7 @@ impl Default for TreeParams {
         TreeParams {
             max_depth: Some(8),
             min_samples_split: 2,
-            min_samples_leaf: 1,
+            min_samples_leaf: 30,
             min_impurity_decrease: 0.0,
             n_bins: 8,
             cv: KFold {
@@ -733,6 +879,12 @@ impl Default for TreeParams {
             parallel: false,
             n_threads: 1,
             parallel_min_samples: 512,
+            scoring: Scoring::Honest,
+            cv_repeats: 1,
+            min_valid_folds: 2,
+            null_permutations: 0,
+            null_quantile: 0.95,
+            shrinkage: 0.0,
         }
     }
 }
@@ -759,12 +911,13 @@ fn make_rule(
             let (lower, upper) = bin_bounds(&edges, state as usize)?;
             if prefix {
                 // Threshold split: left child is `x < edge`. The top bin has no
-                // finite upper edge, so a cut there is degenerate.
-                let edge = upper?;
+                // finite upper edge; its cut is "x is present" (both bounds
+                // open: every finite value left, missing right), which
+                // `split_states` only offers when the node has missing values.
                 Some(SplitRule::ContinuousBin {
                     feature,
                     lower: None,
-                    upper: Some(edge),
+                    upper,
                 })
             } else {
                 Some(SplitRule::ContinuousBin {
@@ -787,6 +940,316 @@ fn make_rule(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Node scoring shared by both build paths
+// ---------------------------------------------------------------------------
+
+/// Ancestor state threaded down the recursion for hierarchical shrinkage.
+struct Ancestor<P> {
+    shrunk: P,
+    raw: P,
+    n: usize,
+}
+
+fn shrunk_prediction<K: Task>(
+    task: &K,
+    params: &TreeParams,
+    anc: Option<&Ancestor<K::Prediction>>,
+    raw: &K::Prediction,
+) -> K::Prediction {
+    match anc {
+        Some(a) if params.shrinkage > 0.0 => {
+            task.shrink(&a.shrunk, &a.raw, raw, a.n, params.shrinkage)
+        }
+        _ => raw.clone(),
+    }
+}
+
+/// The K-fold configuration for repeat `rep`. Repeat 0 is the configured one,
+/// so `cv_repeats = 1` reproduces single K-fold exactly.
+fn repeat_cv(cv: &KFold, rep: usize) -> KFold {
+    let mut c = cv.clone();
+    if rep > 0 {
+        c.seed = cv.seed ^ (rep as u64).wrapping_mul(0xA24B_AED4_963E_E407);
+    }
+    c
+}
+
+/// Fold another repeat's candidates into `acc`, concatenating fold scores of
+/// matching `(feature, state)` candidates.
+fn merge_repeat(acc: &mut Vec<ScoredCandidate>, more: Vec<ScoredCandidate>) {
+    use std::collections::BTreeMap;
+    let mut pos: BTreeMap<(usize, u32), usize> = BTreeMap::new();
+    for (i, c) in acc.iter().enumerate() {
+        pos.insert((c.candidate.feature, c.candidate.state), i);
+    }
+    for c in more {
+        let key = (c.candidate.feature, c.candidate.state);
+        match pos.get(&key) {
+            Some(&i) => {
+                let merged = FoldStats::merged(&[&acc[i].stats, &c.stats]);
+                acc[i].stats = merged;
+            }
+            None => {
+                pos.insert(key, acc.len());
+                acc.push(c);
+            }
+        }
+    }
+}
+
+/// Final node-level aggregation: lets the aggregator see every candidate at
+/// once (for variance moderation) and enforces `min_valid_folds`.
+fn finalize_scores(aggregator: &dyn Aggregator, params: &TreeParams, scored: &mut [ScoredCandidate]) {
+    let scores = {
+        let refs: Vec<&FoldStats> = scored.iter().map(|c| &c.stats).collect();
+        aggregator.aggregate_node(&refs)
+    };
+    for (c, sc) in scored.iter_mut().zip(scores) {
+        let need = params.min_valid_folds.min(c.stats.n_total).max(1);
+        c.score = if c.stats.n_success < need {
+            f64::NEG_INFINITY
+        } else {
+            sc
+        };
+    }
+}
+
+/// Copy of `targets` with the values at `node` randomly permuted among
+/// themselves (the permutation null for one node).
+fn permuted_targets<T: Copy>(targets: &[T], node: &[usize], seed: u64) -> Vec<T> {
+    let mut out = targets.to_vec();
+    let mut vals: Vec<T> = node.iter().map(|&i| targets[i]).collect();
+    let mut rng = SplitMix64::new(seed);
+    for i in (1..vals.len()).rev() {
+        let j = rng.below((i as u64) + 1) as usize;
+        vals.swap(i, j);
+    }
+    for (&i, v) in node.iter().zip(vals) {
+        out[i] = v;
+    }
+    out
+}
+
+fn null_seed(params: &TreeParams, n: usize, p: usize) -> u64 {
+    params.cv.seed
+        ^ 0xD1B5_4A32_D192_ED03
+        ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ ((p as u64) + 1).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+}
+
+fn best_score(scored: &[ScoredCandidate]) -> f64 {
+    select_best(scored).map_or(f64::NEG_INFINITY, |b| b.score)
+}
+
+/// Run the permutation null: the `null_quantile` quantile of the best score
+/// achievable on permuted targets. `score_fn` rescores the node.
+fn null_threshold<T: Copy, F: Fn(&[T]) -> Vec<ScoredCandidate>>(
+    params: &TreeParams,
+    targets: &[T],
+    node: &[usize],
+    score_fn: F,
+) -> f64 {
+    let mut maxima: Vec<f64> = (0..params.null_permutations)
+        .map(|p| {
+            let t2 = permuted_targets(targets, node, null_seed(params, node.len(), p));
+            best_score(&score_fn(&t2[..]))
+        })
+        .collect();
+    quantile_of(&mut maxima, params.null_quantile)
+}
+
+/// Drop candidates whose node-level partition would leave a child with fewer
+/// than `min_leaf` samples, so `min_samples_leaf` restricts which split is
+/// *chosen*. (Checking only the winner would turn the node into a leaf even
+/// when an admissible split exists.) `codes(f)` gives the node samples' codes
+/// for feature `f` in the space of candidate states, exactly as the node will
+/// be partitioned; `prefix(f)` says whether `f` is cut as a threshold
+/// (`code <= state`) rather than by equality. Missing codes exceed every
+/// state, so they count toward the right child, as they are routed.
+fn retain_admissible<P, C>(
+    all: &mut Vec<ScoredCandidate>,
+    n: usize,
+    min_leaf: usize,
+    prefix: P,
+    codes: C,
+) where
+    P: Fn(usize) -> bool,
+    C: Fn(usize) -> Vec<u32>,
+{
+    use std::collections::BTreeMap;
+    if min_leaf <= 1 {
+        // Empty children are already excluded by the candidate generators.
+        return;
+    }
+    let mut sorted: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+    all.retain(|c| {
+        let f = c.candidate.feature;
+        let s = c.candidate.state;
+        let v = sorted.entry(f).or_insert_with(|| {
+            let mut v = codes(f);
+            v.sort_unstable();
+            v
+        });
+        let upto = v.partition_point(|&x| x <= s);
+        let left = if prefix(f) {
+            upto
+        } else {
+            upto - v.partition_point(|&x| x < s)
+        };
+        left >= min_leaf && n - left >= min_leaf
+    });
+}
+
+/// Node-level codes of `indices` for one column, as [`make_rule`] partitions
+/// them: continuous values binned on the node's own quantile edges (so
+/// `x < edges[state]` is `code <= state`), categorical values as their ids.
+fn node_codes(col: &Column, indices: &[usize], n_bins: usize) -> Vec<u32> {
+    match col {
+        Column::Continuous(v) => {
+            let vals: Vec<f64> = indices.iter().map(|&i| v[i]).collect();
+            let edges = quantile_edges(&vals, n_bins);
+            vals.iter().map(|&x| bin_of(&edges, x)).collect()
+        }
+        Column::Categorical(c) => indices.iter().map(|&i| c[i]).collect(),
+    }
+}
+
+/// Score every candidate at a strict-path node (all features, all repeats).
+fn score_node_strict<K: Task>(
+    task: &K,
+    params: &TreeParams,
+    aggregator: &dyn Aggregator,
+    columns: &[Column],
+    targets: &[K::Target],
+    indices: &[usize],
+) -> Vec<ScoredCandidate> {
+    let feature_ids: Vec<usize> = (0..columns.len()).collect();
+    let mut all: Vec<ScoredCandidate> = Vec::new();
+    for rep in 0..params.cv_repeats.max(1) {
+        let folds = repeat_cv(&params.cv, rep).folds(indices);
+        let eval_one = |f: &usize| -> Vec<ScoredCandidate> {
+            let prefix = params.split_style == SplitStyle::Threshold
+                && matches!(columns[*f], Column::Continuous(_));
+            task.score_feature_strict(
+                columns,
+                targets,
+                *f,
+                indices,
+                &folds,
+                params.n_bins,
+                aggregator,
+                prefix,
+                params.scoring,
+            )
+        };
+        let scored: Vec<ScoredCandidate> = if params.parallel && params.n_threads > 1 {
+            par_map(&feature_ids, params.n_threads, eval_one)
+                .into_iter()
+                .flatten()
+                .collect()
+        } else {
+            feature_ids.iter().flat_map(|f| eval_one(f)).collect()
+        };
+        if rep == 0 {
+            all = scored;
+        } else {
+            merge_repeat(&mut all, scored);
+        }
+    }
+    retain_admissible(
+        &mut all,
+        indices.len(),
+        params.min_samples_leaf,
+        |f| {
+            params.split_style == SplitStyle::Threshold
+                && matches!(columns[f], Column::Continuous(_))
+        },
+        |f| node_codes(&columns[f], indices, params.n_bins),
+    );
+    finalize_scores(aggregator, params, &mut all);
+    all
+}
+
+/// Score every candidate at a fast-path node (all features, all repeats).
+fn score_node_fast<K: Task>(
+    task: &K,
+    params: &TreeParams,
+    aggregator: &dyn Aggregator,
+    binned: &BinnedData,
+    targets: &[K::Target],
+    samples: &[SampleId],
+) -> Vec<ScoredCandidate> {
+    let n = samples.len();
+    let idx_usize: Vec<usize> = samples.iter().map(|&s| s as usize).collect();
+    let feature_ids: Vec<usize> = (0..binned.n_features()).collect();
+    let mut all: Vec<ScoredCandidate> = Vec::new();
+    for rep in 0..params.cv_repeats.max(1) {
+        let (order, val_fold, k) = repeat_cv(&params.cv, rep).assign(&idx_usize);
+        if k == 0 {
+            return Vec::new();
+        }
+        let eval_with = |feature: usize, scratch: &mut FastScratch| -> Vec<ScoredCandidate> {
+            let prefix =
+                params.split_style == SplitStyle::Threshold && binned.bins[feature].is_continuous;
+            task.score_feature_fast(
+                &binned.codes[feature],
+                targets,
+                &order,
+                &val_fold,
+                k,
+                binned.bins[feature].max_bin,
+                feature,
+                aggregator,
+                scratch,
+                prefix,
+                params.scoring,
+            )
+        };
+        let scored: Vec<ScoredCandidate> =
+            if params.parallel && params.n_threads > 1 && n >= params.parallel_min_samples {
+                par_map(&feature_ids, params.n_threads, |f: &usize| {
+                    let mut scratch = FastScratch::new();
+                    eval_with(*f, &mut scratch)
+                })
+                .into_iter()
+                .flatten()
+                .collect()
+            } else {
+                // Serial: reuse a single scratch across features.
+                let mut scratch = FastScratch::new();
+                let mut v = Vec::new();
+                for &f in &feature_ids {
+                    v.extend(eval_with(f, &mut scratch));
+                }
+                v
+            };
+        if rep == 0 {
+            all = scored;
+        } else {
+            merge_repeat(&mut all, scored);
+        }
+    }
+    retain_admissible(
+        &mut all,
+        n,
+        params.min_samples_leaf,
+        |f| params.split_style == SplitStyle::Threshold && binned.bins[f].is_continuous,
+        |f| samples.iter().map(|&s| binned.codes[f][s as usize] as u32).collect(),
+    );
+    finalize_scores(aggregator, params, &mut all);
+    all
+}
+
+/// Smallest node that can be split at all: below `2 · min_samples_leaf` every
+/// partition leaves a child too small, so the node is a leaf without scoring.
+fn min_splittable(params: &TreeParams) -> usize {
+    params
+        .min_samples_split
+        .max(2)
+        .max(params.min_samples_leaf.max(1).saturating_mul(2))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_node<K: Task>(
     task: &K,
@@ -796,16 +1259,18 @@ fn build_node<K: Task>(
     targets: &[K::Target],
     indices: &[usize],
     depth: usize,
+    anc: Option<&Ancestor<K::Prediction>>,
 ) -> Node<K::Prediction> {
     let node_targets: Vec<K::Target> = indices.iter().map(|&i| targets[i]).collect();
-    let prediction = task.leaf(&node_targets);
+    let raw = task.leaf(&node_targets);
+    let prediction = shrunk_prediction(task, params, anc, &raw);
     let leaf = |pred: K::Prediction| Node::Leaf {
         prediction: pred,
         n_samples: indices.len(),
     };
 
     // --- cheap stopping criteria -------------------------------------------
-    if indices.len() < params.min_samples_split.max(2) {
+    if indices.len() < min_splittable(params) {
         return leaf(prediction);
     }
     if let Some(md) = params.max_depth {
@@ -819,34 +1284,7 @@ fn build_node<K: Task>(
     }
 
     // --- score every candidate split via cross-validation ------------------
-    let folds = params.cv.folds(indices);
-
-    // Per-feature scoring closure, delegated to the task so alternative
-    // strict-path scorers (e.g. objective metrics) plug in transparently.
-    let eval_one = |f: &usize| -> Vec<ScoredCandidate> {
-        let prefix = params.split_style == SplitStyle::Threshold
-            && matches!(columns[*f], Column::Continuous(_));
-        task.score_feature_strict(
-            columns,
-            targets,
-            *f,
-            indices,
-            &folds,
-            params.n_bins,
-            aggregator,
-            prefix,
-        )
-    };
-
-    let feature_ids: Vec<usize> = (0..columns.len()).collect();
-    let scored: Vec<ScoredCandidate> = if params.parallel && params.n_threads > 1 {
-        par_map(&feature_ids, params.n_threads, eval_one)
-            .into_iter()
-            .flatten()
-            .collect()
-    } else {
-        feature_ids.iter().flat_map(|f| eval_one(f)).collect()
-    };
+    let scored = score_node_strict(task, params, aggregator, columns, targets, indices);
 
     // --- select and validate the winner ------------------------------------
     let best = match select_best(&scored) {
@@ -855,6 +1293,14 @@ fn build_node<K: Task>(
     };
     if best.score <= params.min_impurity_decrease {
         return leaf(prediction);
+    }
+    if params.null_permutations > 0 {
+        let thr = null_threshold(params, targets, indices, |t: &[K::Target]| {
+            score_node_strict(task, params, aggregator, columns, t, indices)
+        });
+        if best.score <= thr {
+            return leaf(prediction);
+        }
     }
 
     let rule = match make_rule(
@@ -870,7 +1316,8 @@ fn build_node<K: Task>(
         None => return leaf(prediction),
     };
 
-    // --- partition and enforce min_samples_leaf ----------------------------
+    // --- partition (min_samples_leaf was applied to the candidates; this ----
+    // --- check is a safety net) ---------------------------------------------
     let mut left_idx = Vec::new();
     let mut right_idx = Vec::new();
     for &i in indices {
@@ -887,6 +1334,11 @@ fn build_node<K: Task>(
     }
 
     // --- recurse (tree growth is sequential by design) ---------------------
+    let me = Ancestor {
+        shrunk: prediction,
+        raw,
+        n: indices.len(),
+    };
     let left = build_node(
         task,
         params,
@@ -895,6 +1347,7 @@ fn build_node<K: Task>(
         targets,
         &left_idx,
         depth + 1,
+        Some(&me),
     );
     let right = build_node(
         task,
@@ -904,6 +1357,7 @@ fn build_node<K: Task>(
         targets,
         &right_idx,
         depth + 1,
+        Some(&me),
     );
     Node::Internal {
         rule,
@@ -923,11 +1377,12 @@ fn make_rule_fast(fb: &FeatureBins, feature: usize, state: u32, prefix: bool) ->
     if fb.is_continuous {
         let (lower, upper) = fb.cont_bounds(state as usize)?;
         if prefix {
-            let edge = upper?; // top bin has no finite edge -> degenerate cut
+            // `upper == None` is the top bin: the "x is present" cut, which
+            // the fast scorers only offer when the node has missing values.
             Some(SplitRule::ContinuousBin {
                 feature,
                 lower: None,
-                upper: Some(edge),
+                upper,
             })
         } else {
             Some(SplitRule::ContinuousBin {
@@ -965,16 +1420,18 @@ fn build_node_fast<K: Task>(
     targets: &[K::Target],
     samples: &mut [SampleId],
     depth: usize,
+    anc: Option<&Ancestor<K::Prediction>>,
 ) -> Node<K::Prediction> {
     let node_targets: Vec<K::Target> = samples.iter().map(|&s| targets[s as usize]).collect();
-    let prediction = task.leaf(&node_targets);
+    let raw = task.leaf(&node_targets);
+    let prediction = shrunk_prediction(task, params, anc, &raw);
     let n = samples.len();
     let leaf = |pred: K::Prediction| Node::Leaf {
         prediction: pred,
         n_samples: n,
     };
 
-    if n < params.min_samples_split.max(2) {
+    if n < min_splittable(params) {
         return leaf(prediction);
     }
     if let Some(md) = params.max_depth {
@@ -986,69 +1443,23 @@ fn build_node_fast<K: Task>(
         return leaf(prediction);
     }
 
-    // One compact fold assignment for the whole node.
-    let idx_usize: Vec<usize> = samples.iter().map(|&s| s as usize).collect();
-    let (order, val_fold, k) = params.cv.assign(&idx_usize);
-    if k == 0 {
-        return leaf(prediction);
-    }
-
-    let n_features = binned.n_features();
-    let eval_one = |f: &usize| -> Vec<ScoredCandidate> {
-        let feature = *f;
-        let mut scratch = FastScratch::new();
-        let prefix =
-            params.split_style == SplitStyle::Threshold && binned.bins[feature].is_continuous;
-        task.score_feature_fast(
-            &binned.codes[feature],
-            targets,
-            &order,
-            &val_fold,
-            k,
-            binned.bins[feature].max_bin,
-            feature,
-            aggregator,
-            &mut scratch,
-            prefix,
-        )
-    };
-
-    let feature_ids: Vec<usize> = (0..n_features).collect();
-    let scored: Vec<ScoredCandidate> =
-        if params.parallel && params.n_threads > 1 && n >= params.parallel_min_samples {
-            par_map(&feature_ids, params.n_threads, eval_one)
-                .into_iter()
-                .flatten()
-                .collect()
-        } else {
-            // Serial: reuse a single scratch across features.
-            let mut scratch = FastScratch::new();
-            let mut all = Vec::new();
-            for &feature in &feature_ids {
-                let prefix = params.split_style == SplitStyle::Threshold
-                    && binned.bins[feature].is_continuous;
-                all.extend(task.score_feature_fast(
-                    &binned.codes[feature],
-                    targets,
-                    &order,
-                    &val_fold,
-                    k,
-                    binned.bins[feature].max_bin,
-                    feature,
-                    aggregator,
-                    &mut scratch,
-                    prefix,
-                ));
-            }
-            all
-        };
-
+    let scored = score_node_fast(task, params, aggregator, binned, targets, &*samples);
     let best = match select_best(&scored) {
         Some(b) => b,
         None => return leaf(prediction),
     };
     if best.score <= params.min_impurity_decrease {
         return leaf(prediction);
+    }
+    if params.null_permutations > 0 {
+        let node_idx: Vec<usize> = samples.iter().map(|&s| s as usize).collect();
+        let samples_ro: &[SampleId] = &*samples;
+        let thr = null_threshold(params, targets, &node_idx, |t: &[K::Target]| {
+            score_node_fast(task, params, aggregator, binned, t, samples_ro)
+        });
+        if best.score <= thr {
+            return leaf(prediction);
+        }
     }
     let feature = best.candidate.feature;
     let state = best.candidate.state;
@@ -1076,8 +1487,22 @@ fn build_node_fast<K: Task>(
         return leaf(prediction);
     }
 
+    let me = Ancestor {
+        shrunk: prediction,
+        raw,
+        n,
+    };
     let (left_s, right_s) = samples.split_at_mut(p);
-    let left = build_node_fast(task, params, aggregator, binned, targets, left_s, depth + 1);
+    let left = build_node_fast(
+        task,
+        params,
+        aggregator,
+        binned,
+        targets,
+        left_s,
+        depth + 1,
+        Some(&me),
+    );
     let right = build_node_fast(
         task,
         params,
@@ -1086,6 +1511,7 @@ fn build_node_fast<K: Task>(
         targets,
         right_s,
         depth + 1,
+        Some(&me),
     );
     Node::Internal {
         rule,
@@ -1154,6 +1580,7 @@ impl<K: Task> DecisionTree<K> {
                     targets,
                     &indices,
                     0,
+                    None,
                 ));
             }
             SplitMode::Fast => {
@@ -1173,6 +1600,7 @@ impl<K: Task> DecisionTree<K> {
                     targets,
                     &mut samples,
                     0,
+                    None,
                 ));
             }
         }
@@ -1317,6 +1745,7 @@ mod tests {
         let y = vec![0usize, 0, 1, 1, 0, 0, 1, 1];
         let mut params = TreeParams::default();
         params.cv = KFold::new(2, 1);
+        params.min_samples_leaf = 1; // toy data, smaller than the default leaf size
         let mut t = DecisionTree::new(Classification::gini(2), params, Box::new(Mean));
         t.fit(&cols, &y).unwrap();
         assert!(t.n_leaves() >= 2);
@@ -1331,6 +1760,7 @@ mod tests {
         let y = vec![1.0, 1.0, 1.0, 9.0, 9.0, 9.0];
         let mut params = TreeParams::default();
         params.cv = KFold::new(2, 3);
+        params.min_samples_leaf = 1; // toy data, smaller than the default leaf size
         let mut t = DecisionTree::new(Regression::mse(), params, Box::new(Mean));
         t.fit(&cols, &y).unwrap();
         assert!((t.predict_one(&[FeatureValue::cat(0)]) - 1.0).abs() < 1e-9);
@@ -1346,6 +1776,247 @@ mod tests {
         let p = t.predict_one(&[FeatureValue::cat(0)]);
         let s: f64 = p.proba.iter().sum();
         assert!((s - 1.0).abs() < 1e-9);
+    }
+
+    /// Pure-noise binary data: `n` samples, `p` continuous features.
+    fn noise_data(n: usize, p: usize, seed: u64) -> (Vec<Column>, Vec<usize>) {
+        let mut rng = SplitMix64::new(seed);
+        let cols = (0..p)
+            .map(|_| Column::Continuous((0..n).map(|_| (rng.next_u64() % 10_000) as f64).collect()))
+            .collect();
+        let y = (0..n).map(|_| (rng.next_u64() % 2) as usize).collect();
+        (cols, y)
+    }
+
+    #[test]
+    fn null_test_stops_noise_splits() {
+        // Honest scoring alone does not reliably shrink trees on pure noise:
+        // the best of many near-zero candidates is still positive, most of all
+        // at tiny nodes. The permutation null accounts for that search.
+        let (cols, y) = noise_data(400, 3, 9);
+        for mode in [SplitMode::Strict, SplitMode::Fast] {
+            // Leaf size 1 isolates the effect of the null test itself.
+            let mut p_ins = TreeParams::default();
+            p_ins.mode = mode;
+            p_ins.min_samples_leaf = 1;
+            p_ins.scoring = Scoring::InSample;
+            let mut p_null = p_ins.clone();
+            p_null.scoring = Scoring::Honest;
+            p_null.null_permutations = 19;
+            let mut a = DecisionTree::new(Classification::gini(2), p_ins, Box::new(Mean));
+            let mut b = DecisionTree::new(Classification::gini(2), p_null, Box::new(Mean));
+            a.fit(&cols, &y).unwrap();
+            b.fit(&cols, &y).unwrap();
+            assert!(
+                b.n_leaves() <= 3 && b.n_leaves() < a.n_leaves(),
+                "{mode:?}: honest+null {} vs in-sample {} leaves",
+                b.n_leaves(),
+                a.n_leaves()
+            );
+        }
+    }
+
+    #[test]
+    fn permutation_null_only_prunes() {
+        // The null test can only block splits, so it never adds leaves.
+        let (cols, y) = noise_data(300, 2, 4);
+        for mode in [SplitMode::Strict, SplitMode::Fast] {
+            let mut p0 = TreeParams::default();
+            p0.mode = mode;
+            let mut p1 = p0.clone();
+            p1.null_permutations = 9;
+            let mut a = DecisionTree::new(Classification::gini(2), p0, Box::new(Mean));
+            let mut b = DecisionTree::new(Classification::gini(2), p1, Box::new(Mean));
+            a.fit(&cols, &y).unwrap();
+            b.fit(&cols, &y).unwrap();
+            assert!(b.n_leaves() <= a.n_leaves());
+        }
+    }
+
+    #[test]
+    fn permutation_null_keeps_real_signal() {
+        let x: Vec<f64> = (0..200).map(|i| i as f64).collect();
+        let y: Vec<usize> = (0..200).map(|i| usize::from(i >= 100)).collect();
+        let mut params = TreeParams::default();
+        params.null_permutations = 19;
+        let mut t = DecisionTree::new(Classification::gini(2), params, Box::new(Mean));
+        t.fit(&[Column::Continuous(x)], &y).unwrap();
+        assert!(t.n_leaves() >= 2);
+        assert_eq!(t.predict_one(&[FeatureValue::cont(10.0)]).class, 0);
+        assert_eq!(t.predict_one(&[FeatureValue::cont(190.0)]).class, 1);
+    }
+
+    #[test]
+    fn repeated_cv_is_deterministic_and_learns() {
+        let x: Vec<f64> = (0..120).map(|i| i as f64).collect();
+        let y: Vec<usize> = (0..120).map(|i| usize::from(i >= 60)).collect();
+        let cols = vec![Column::Continuous(x)];
+        for mode in [SplitMode::Strict, SplitMode::Fast] {
+            let mut params = TreeParams::default();
+            params.mode = mode;
+            params.cv_repeats = 3;
+            let mut a = DecisionTree::new(Classification::gini(2), params.clone(), Box::new(Mean));
+            let mut b = DecisionTree::new(Classification::gini(2), params, Box::new(Mean));
+            a.fit(&cols, &y).unwrap();
+            b.fit(&cols, &y).unwrap();
+            assert_eq!(a.n_leaves(), b.n_leaves());
+            assert_eq!(a.export_nodes().len(), b.export_nodes().len());
+            assert_eq!(a.predict_one(&[FeatureValue::cont(5.0)]).class, 0);
+            assert_eq!(a.predict_one(&[FeatureValue::cont(115.0)]).class, 1);
+        }
+    }
+
+    #[test]
+    fn shrinkage_pulls_leaves_toward_root() {
+        let cols = vec![Column::Categorical(vec![0, 0, 0, 0, 1, 1, 1, 1])];
+        let y = vec![1.0, 1.0, 1.0, 1.0, 9.0, 9.0, 9.0, 9.0];
+        let mut p0 = TreeParams::default();
+        p0.cv = KFold::new(2, 1);
+        p0.min_samples_leaf = 1; // toy data, smaller than the default leaf size
+        let mut p1 = p0.clone();
+        p1.shrinkage = 8.0; // parent n = 8 -> child deviation weighted 1/2
+        let mut a = DecisionTree::new(Regression::mse(), p0, Box::new(Mean));
+        let mut b = DecisionTree::new(Regression::mse(), p1, Box::new(Mean));
+        a.fit(&cols, &y).unwrap();
+        b.fit(&cols, &y).unwrap();
+        assert_eq!(a.n_leaves(), b.n_leaves()); // structure unchanged
+        assert_eq!(a.n_leaves(), 2);
+        assert!((a.predict_one(&[FeatureValue::cat(0)]) - 1.0).abs() < 1e-9);
+        // root 5 + (1 - 5) / (1 + 8/8) = 3, and symmetrically 7.
+        assert!((b.predict_one(&[FeatureValue::cat(0)]) - 3.0).abs() < 1e-9);
+        assert!((b.predict_one(&[FeatureValue::cat(1)]) - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn class_shrinkage_keeps_valid_probabilities() {
+        let ps = ClassPrediction { class: 0, proba: vec![0.9, 0.1] };
+        let pr = ClassPrediction { class: 1, proba: vec![0.2, 0.8] };
+        let raw = ClassPrediction { class: 0, proba: vec![1.0, 0.0] };
+        let out = shrink_class(&ps, &pr, &raw, 10, 1.0);
+        let total: f64 = out.proba.iter().sum();
+        assert!((total - 1.0).abs() < 1e-9);
+        assert!(out.proba.iter().all(|&p| p >= 0.0));
+        assert_eq!(out.class, 0);
+    }
+
+    #[test]
+    fn mostly_missing_feature_does_not_win_root() {
+        // x0: 90% missing, perfectly separates the 10% present.
+        // x1: complete, 80% accurate. Scored per *node* sample (missing values
+        // in the right child, as routed), x1 is far better (~0.18 vs ~0.03
+        // honest Brier gain). Before the fast-path fix, missing values were
+        // dropped from scoring and x0 won with ~0.50 per *present* sample.
+        let n = 400usize;
+        let y: Vec<usize> = (0..n).map(|i| i % 2).collect();
+        let x0: Vec<f64> = (0..n)
+            .map(|i| if i % 20 < 2 { y[i] as f64 } else { f64::NAN })
+            .collect();
+        let x1: Vec<f64> = (0..n)
+            .map(|i| {
+                let ye = if i % 5 == 0 { 1 - y[i] } else { y[i] };
+                ye as f64 + i as f64 * 1e-4
+            })
+            .collect();
+        let cols = vec![Column::Continuous(x0), Column::Continuous(x1)];
+        for mode in [SplitMode::Strict, SplitMode::Fast] {
+            let mut params = TreeParams::default();
+            params.mode = mode;
+            params.max_depth = Some(1);
+            let mut t = DecisionTree::new(Classification::gini(2), params, Box::new(Mean));
+            t.fit(&cols, &y).unwrap();
+            let root = &t.export_nodes()[0];
+            assert!(!root.is_leaf, "{mode:?}: expected a split");
+            assert_eq!(root.feature, 1, "{mode:?}: mostly-missing feature won");
+        }
+    }
+
+    #[test]
+    fn informative_missingness_splits_on_presence() {
+        // y = 1 exactly when x is missing; present values carry no signal, so
+        // the best cut is "x is present". Strict mode used to score that cut
+        // but could not build a rule for it, turning the root into a leaf.
+        let n = 200usize;
+        let x: Vec<f64> = (0..n)
+            .map(|i| if i % 4 == 0 { f64::NAN } else { i as f64 })
+            .collect();
+        let y: Vec<usize> = (0..n).map(|i| usize::from(i % 4 == 0)).collect();
+        let cols = vec![Column::Continuous(x)];
+        for mode in [SplitMode::Strict, SplitMode::Fast] {
+            let mut params = TreeParams::default();
+            params.mode = mode;
+            let mut t = DecisionTree::new(Classification::gini(2), params, Box::new(Mean));
+            t.fit(&cols, &y).unwrap();
+            let root = &t.export_nodes()[0];
+            assert!(!root.is_leaf, "{mode:?}: root should split");
+            assert_eq!(root.lower, f64::NEG_INFINITY, "{mode:?}");
+            assert_eq!(root.upper, f64::INFINITY, "{mode:?}: expected the presence rule");
+            assert_eq!(t.n_leaves(), 2, "{mode:?}");
+            assert_eq!(t.predict_one(&[FeatureValue::cont(f64::NAN)]).class, 1);
+            assert_eq!(t.predict_one(&[FeatureValue::cont(50.0)]).class, 0);
+            // Present values outside the training range still count as present.
+            assert_eq!(t.predict_one(&[FeatureValue::cont(1e9)]).class, 0);
+        }
+    }
+
+    #[test]
+    fn no_presence_rule_without_missing_values() {
+        let (cols, y) = noise_data(300, 2, 5);
+        for mode in [SplitMode::Strict, SplitMode::Fast] {
+            let mut params = TreeParams::default();
+            params.mode = mode;
+            params.max_depth = Some(4);
+            // Accept non-improving splits so many cuts get realised.
+            params.min_impurity_decrease = -1.0;
+            let mut t = DecisionTree::new(Classification::gini(2), params, Box::new(Mean));
+            t.fit(&cols, &y).unwrap();
+            assert!(t.n_leaves() > 1, "{mode:?}");
+            for e in t.export_nodes().iter().filter(|e| !e.is_leaf) {
+                assert!(e.upper.is_finite(), "{mode:?}: presence rule with no missing values");
+            }
+        }
+    }
+
+    #[test]
+    fn min_samples_leaf_filters_candidates_before_selection() {
+        // One threshold feature; node codes: 10 samples in bin 0, 40 in bin 1,
+        // 50 in bin 2. The best-scoring cut (after bin 0) is inadmissible.
+        let mut codes: Vec<u32> = vec![0; 10];
+        codes.extend(vec![1; 40]);
+        codes.extend(vec![2; 50]);
+        let cand = |state: u32, score: f64| ScoredCandidate {
+            candidate: Candidate { feature: 0, state },
+            score,
+            stats: FoldStats::from_scores(vec![score, score], 2),
+        };
+        let mut all = vec![cand(0, 0.9), cand(1, 0.5), cand(2, 0.1)];
+        retain_admissible(&mut all, 100, 30, |_| true, |_| codes.clone());
+        let kept: Vec<u32> = all.iter().map(|c| c.candidate.state).collect();
+        assert_eq!(kept, vec![1]); // 10|90 and 100|0 dropped, 50|50 kept
+        // Equality (single-bin) style: bin 1 alone is 40|60, admissible.
+        let mut all = vec![cand(0, 0.9), cand(1, 0.5), cand(2, 0.1)];
+        retain_admissible(&mut all, 100, 30, |_| false, |_| codes.clone());
+        let kept: Vec<u32> = all.iter().map(|c| c.candidate.state).collect();
+        assert_eq!(kept, vec![1, 2]);
+    }
+
+    #[test]
+    fn inadmissible_best_split_does_not_stop_growth() {
+        // The purest cut isolates the 20 positives at the low end, which is
+        // below the default leaf size. Vetoing only the winner used to make
+        // the root a leaf; an admissible split (50 | 150) exists and is taken.
+        let x: Vec<f64> = (0..200).map(|i| i as f64).collect();
+        let y: Vec<usize> = (0..200).map(|i| usize::from(i < 20)).collect();
+        for mode in [SplitMode::Strict, SplitMode::Fast] {
+            let mut params = TreeParams::default();
+            params.mode = mode;
+            assert_eq!(params.min_samples_leaf, 30);
+            let mut t = DecisionTree::new(Classification::gini(2), params, Box::new(Mean));
+            t.fit(&[Column::Continuous(x.clone())], &y).unwrap();
+            assert_eq!(t.n_leaves(), 2, "{mode:?}");
+            for e in t.export_nodes().iter().filter(|e| e.is_leaf) {
+                assert!(e.n_samples >= 30, "{mode:?}: leaf of {}", e.n_samples);
+            }
+        }
     }
 
     #[test]

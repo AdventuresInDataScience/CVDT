@@ -20,7 +20,9 @@ def test_classifier_learns():
         n_samples=400, n_features=8, n_informative=5, n_classes=2, random_state=0
     )
     clf = CVDTClassifier(cv_folds=4, max_depth=6).fit(X, y)
-    assert clf.score(X, y) > 0.85
+    # Training accuracy; the default min_samples_leaf=30 regularises, so this
+    # sits below what an unconstrained tree reaches (~0.95 at leaf size 1).
+    assert clf.score(X, y) > 0.8
     assert set(clf.classes_) == set(np.unique(y))
     proba = clf.predict_proba(X)
     assert proba.shape == (X.shape[0], 2)
@@ -120,13 +122,19 @@ def test_objective_recall_beats_gini_on_recall():
     # stronger general learner and can win outright on recall for a given
     # dataset, which would make an "objective >= impurity on its own metric"
     # comparison flaky; the single-bin path keeps the two trees comparable.
+    # For the same reason the impurity baseline is pinned to the 0.7
+    # ``scoring="in_sample"``: honest scoring (the 0.8 default) changes the
+    # impurity tree, not the objective one, and on this data lifts its recall
+    # above the objective tree's, which is not what this test is about.
     from sklearn.metrics import recall_score
 
     X, y = make_classification(
         n_samples=800, n_features=10, n_informative=6, n_classes=2,
         weights=[0.85, 0.15], random_state=5,
     )
-    gini = CVDTClassifier(cv_folds=4, max_depth=6, split_style="bin").fit(X, y)
+    gini = CVDTClassifier(
+        cv_folds=4, max_depth=6, split_style="bin", scoring="in_sample"
+    ).fit(X, y)
     rec = CVDTClassifier(
         objective="recall", average="binary", pos_label=1, cv_folds=4,
         max_depth=6, min_impurity_decrease=-1.0, split_style="bin",
@@ -165,7 +173,16 @@ def test_determinism_same_seed():
 
 @pytest.mark.parametrize(
     "aggregator",
-    ["mean", "median", "trimmed_mean", "signal_to_noise", "mean_minus_lambda_std"],
+    [
+        "mean",
+        "median",
+        "trimmed_mean",
+        "signal_to_noise",
+        "mean_minus_lambda_std",
+        "quantile",
+        "moderated_signal_to_noise",
+        "moderated_mean_minus_lambda_std",
+    ],
 )
 def test_all_aggregators_fit(aggregator):
     X, y = make_classification(n_samples=250, n_features=6, random_state=1)
@@ -218,6 +235,10 @@ def test_set_params_changes_behavior():
         {"objective": "f1", "average": "bogus"},
         {"n_bins": 1},
         {"cv_folds": 1},
+        {"scoring": "optimistic"},
+        {"cv_repeats": 0},
+        {"null_quantile": 1.5},
+        {"shrinkage": -1.0},
     ],
 )
 def test_invalid_params_raise(kwargs):
@@ -265,6 +286,9 @@ def test_tree_export_text_and_graphviz():
     assert isinstance(txt, str) and len(txt) > 0
     dot = clf.export_graphviz()
     assert dot.startswith("digraph")
+    # Internal nodes break the label with DOT's `\n`, not a literal `\\n`.
+    if not clf.get_tree()["is_leaf"][0]:
+        assert "\\nn=" in dot and "\\\\nn=" not in dot
     tree = clf.get_tree()
     assert tree["node_count"] == len(tree["children_left"])
     # leaves have no children
@@ -284,6 +308,8 @@ def test_get_params_lists_all_hyperparameters():
         "min_impurity_decrease", "n_bins", "cv_folds", "cv_seed", "cv_shuffle",
         "mode", "split_style", "aggregator", "agg_frac", "agg_eps", "agg_lambda",
         "parallel", "n_threads", "parallel_min_samples", "categorical_features",
+        "scoring", "cv_repeats", "min_valid_folds", "null_permutations",
+        "null_quantile", "shrinkage", "agg_q", "agg_d0",
     }
     assert expected <= keys
 
@@ -296,11 +322,18 @@ def test_split_style_fits_and_predicts(style, mode):
     X, y = make_classification(
         n_samples=300, n_features=6, n_informative=4, n_classes=2, random_state=1
     )
-    clf = CVDTClassifier(cv_folds=4, max_depth=6, n_bins=16, mode=mode, split_style=style)
+    # Leaf size 1: this tests split geometry. With "bin" a child is one
+    # quantile bin (~300 / 16 = 19 samples here), below the default leaf size
+    # of 30, so the default would leave no admissible bin-membership split.
+    clf = CVDTClassifier(
+        cv_folds=4, max_depth=6, n_bins=16, mode=mode, split_style=style, min_samples_leaf=1
+    )
     clf.fit(X, y)
     # A modest floor both styles clear; threshold typically scores much higher.
     assert clf.score(X, y) > 0.7
-    reg = CVDTRegressor(cv_folds=4, max_depth=6, n_bins=16, mode=mode, split_style=style)
+    reg = CVDTRegressor(
+        cv_folds=4, max_depth=6, n_bins=16, mode=mode, split_style=style, min_samples_leaf=1
+    )
     reg.fit(X, y.astype(float))
     assert reg.predict(X).shape == (X.shape[0],)
 
@@ -339,3 +372,96 @@ def test_sklearn_check_estimator():
 
     check_estimator(CVDTClassifier())
     check_estimator(CVDTRegressor())
+
+
+# ---------------------------------------------------------------------------
+# v0.8: honest scoring, repeated CV, permutation null, shrinkage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["strict", "fast"])
+def test_null_test_stops_noise_splits(mode):
+    # Honest scoring alone does not reliably shrink trees on pure noise: the
+    # best of many near-zero candidates is still positive, most of all at
+    # tiny nodes, so it can grow as many leaves as in-sample scoring. The
+    # permutation null accounts for that search and should leave (almost)
+    # a stump.
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(400, 4))
+    y = rng.integers(0, 2, size=400)
+    # Leaf size 1 isolates the effect of the null test itself.
+    legacy = CVDTClassifier(mode=mode, scoring="in_sample", min_samples_leaf=1).fit(X, y)
+    null = CVDTClassifier(mode=mode, null_permutations=19, min_samples_leaf=1).fit(X, y)
+    assert null.get_n_leaves() <= 3
+    assert null.get_n_leaves() < legacy.get_n_leaves()
+
+
+@pytest.mark.parametrize("mode", ["strict", "fast"])
+def test_permutation_null_only_prunes(mode):
+    rng = np.random.default_rng(1)
+    X = rng.normal(size=(300, 3))
+    y = rng.integers(0, 2, size=300)
+    base = CVDTClassifier(mode=mode).fit(X, y)
+    null = CVDTClassifier(mode=mode, null_permutations=9).fit(X, y)
+    assert null.get_n_leaves() <= base.get_n_leaves()
+
+
+def test_repeats_and_shrinkage_fit_and_predict():
+    X, y = make_classification(n_samples=300, n_features=6, random_state=3)
+    clf = CVDTClassifier(
+        cv_repeats=3, shrinkage=10.0, aggregator="moderated_signal_to_noise"
+    ).fit(X, y)
+    p = clf.predict_proba(X)
+    np.testing.assert_allclose(p.sum(axis=1), 1.0, atol=1e-9)
+    assert clf.score(X, y) > 0.6
+
+
+def test_shrinkage_keeps_structure_and_regression_means():
+    X, y = make_regression(n_samples=200, n_features=4, noise=10.0, random_state=0)
+    a = CVDTRegressor(shrinkage=0.0).fit(X, y)
+    b = CVDTRegressor(shrinkage=50.0).fit(X, y)
+    assert a.get_n_leaves() == b.get_n_leaves()
+    # Shrinkage pulls predictions toward the root mean.
+    assert np.var(b.predict(X)) < np.var(a.predict(X))
+
+
+@pytest.mark.parametrize("mode", ["strict", "fast"])
+def test_informative_missingness_splits_on_presence(mode):
+    # y = 1 exactly when x0 is missing. The best cut is "x0 is present", which
+    # strict mode used to score but could not build (the root became a leaf).
+    rng = np.random.default_rng(2)
+    X = rng.normal(size=(300, 2))
+    y = (rng.random(300) < 0.3).astype(int)
+    X[y == 1, 0] = np.nan
+    clf = CVDTClassifier(mode=mode).fit(X, y)
+    tree = clf.get_tree()
+    assert not tree["is_leaf"][0]
+    assert tree["feature"][0] == 0
+    assert tree["lower"][0] == float("-inf") and tree["upper"][0] == float("inf")
+    assert clf.export_text().splitlines()[0] == "if x[0] is present:"
+    probe = np.array([[np.nan, 0.0], [0.0, 0.0], [1e9, 0.0]])
+    np.testing.assert_array_equal(clf.predict(probe), [1, 0, 0])
+
+
+def test_unpickling_pre_0_8_estimator_fills_legacy_params():
+    import pickle
+
+    X, y = make_classification(n_samples=200, n_features=4, random_state=0)
+    clf = CVDTClassifier(cv_folds=4, max_depth=3).fit(X, y)
+    state = clf.__getstate__()
+    # Simulate a 0.6-era pickle: none of the 0.7 / 0.8 parameters exist yet.
+    for k in ["split_style", "scoring", "cv_repeats", "min_valid_folds",
+              "null_permutations", "null_quantile", "shrinkage", "agg_q", "agg_d0"]:
+        state.pop(k)
+    old = CVDTClassifier.__new__(CVDTClassifier)
+    old.__setstate__(state)
+    params = old.get_params()
+    assert params["split_style"] == "bin"
+    assert params["scoring"] == "in_sample"
+    assert params["min_valid_folds"] == 1
+    assert params["shrinkage"] == 0.0
+    repr(old)
+    clone(old)
+    np.testing.assert_array_equal(old.predict(X), clf.predict(X))
+    # Current pickles are untouched.
+    assert pickle.loads(pickle.dumps(clf)).get_params() == clf.get_params()

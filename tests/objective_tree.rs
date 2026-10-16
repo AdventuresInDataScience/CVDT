@@ -34,8 +34,8 @@ fn each_objective_learns_separable_strict() {
     // Objectives that reward getting *both* classes right separate the clusters.
     // Recall is deliberately excluded: recall of the positive class is maximised
     // (=1.0) by predicting the positive class for everything, so a recall-driven
-    // tree correctly collapses to an all-positive prediction rather than
-    // separating the data — that case is checked in `recall_prefers_all_positive`.
+    // tree need not separate the data — that case is checked in
+    // `recall_objective_recalls_every_positive`.
     let (cols, y) = separable();
     let tasks = [
         ObjectiveClassification::f1(2, Average::Binary { pos_label: 1 }),
@@ -56,10 +56,12 @@ fn each_objective_learns_separable_strict() {
 }
 
 #[test]
-fn recall_prefers_all_positive() {
-    // Recall of the positive class has no penalty for false positives, so its
-    // greedy optimum on any data is to predict the positive class everywhere
-    // (recall = 1.0). The tree should therefore label both clusters positive.
+fn recall_objective_recalls_every_positive() {
+    // Recall of the positive class has no penalty for false positives, so
+    // any tree that predicts every positive as positive is optimal (recall =
+    // 1.0): labelling everything positive, or separating the clusters. Which
+    // of those ties wins depends on tie-breaking and leaf size, so only the
+    // optimum itself is asserted.
     let (cols, y) = separable();
     let mut t = DecisionTree::new(
         ObjectiveClassification::recall(2, Average::Binary { pos_label: 1 }),
@@ -67,8 +69,13 @@ fn recall_prefers_all_positive() {
         Box::new(Mean),
     );
     t.fit(&cols, &y).unwrap();
-    assert_eq!(class_at(&t, 0.2), 1);
-    assert_eq!(class_at(&t, 3.3), 1);
+    if let Column::Continuous(x) = &cols[0] {
+        for (xi, &yi) in x.iter().zip(&y) {
+            if yi == 1 {
+                assert_eq!(class_at(&t, *xi), 1, "positive at x = {xi} not recalled");
+            }
+        }
+    }
 }
 
 #[test]

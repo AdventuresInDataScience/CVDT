@@ -1,12 +1,14 @@
 """Render a CVDT tree (as returned by the native ``export_tree``) to text or
 Graphviz DOT.
 
-CVDT splits are membership tests, not CART-style thresholds: a continuous split
-routes a sample *left* when its value falls in a half-open interval
-``[lower, upper)`` (open ends shown as one-sided inequalities), and a categorical
-split routes left when the feature equals a specific category. "Left" is always
-the branch where the condition is **true**; anything else (including missing /
-non-finite values) routes right.
+A continuous split routes a sample *left* when its value falls in a half-open
+interval ``[lower, upper)``: a CART-style threshold (``split_style="threshold"``)
+is ``x < upper`` with an open lower end, a single-bin split is
+``lower <= x < upper``, and a split with both ends open is a presence test
+(``x is present``, i.e. not missing). A categorical split routes left when the
+feature equals a specific category. "Left" is always the branch where the
+condition is **true**; anything else (including missing / non-finite values)
+routes right.
 """
 
 from __future__ import annotations
@@ -40,7 +42,8 @@ def _condition(tree, i, feature_names):
         return f"{name} >= {_num(lo)}"
     if not lo_open and not hi_open:
         return f"{_num(lo)} <= {name} < {_num(hi)}"
-    return f"{name} (any)"
+    # Both ends open: every present value matches; only missing routes right.
+    return f"{name} is present"
 
 
 def _leaf_label(tree, i, class_names):
@@ -102,8 +105,11 @@ def export_graphviz(tree, feature_names=None, class_names=None):
             label = _leaf_label(tree, i, class_names)
             out.append(f'  {i} [label="{_dot_escape(label)}", fillcolor="#e8f4ea"] ;')
         else:
-            label = _condition(tree, i, feature_names) + f"\\nn={tree['n_samples'][i]}"
-            out.append(f'  {i} [label="{_dot_escape(label)}"] ;')
+            # Escape the user-visible text first, then append the DOT line
+            # break; escaping afterwards would turn `\n` into a literal `\\n`.
+            label = _dot_escape(_condition(tree, i, feature_names))
+            label += f"\\nn={tree['n_samples'][i]}"
+            out.append(f'  {i} [label="{label}"] ;')
     for i in range(nc):
         if not tree["is_leaf"][i]:
             lft = tree["children_left"][i]

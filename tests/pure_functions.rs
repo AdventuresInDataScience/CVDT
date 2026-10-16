@@ -90,8 +90,8 @@ fn present_states_unique_sorted() {
 fn aggregator_known_values() {
     let s = FoldStats::from_scores(vec![1.0, 2.0, 3.0], 3);
     approx(Mean.aggregate(&s), 2.0);
-    // population std of {1,2,3} = sqrt(2/3)
-    let std = (2.0_f64 / 3.0).sqrt();
+    // sample (Bessel-corrected) std of {1,2,3} = 1
+    let std = 1.0_f64;
     approx(MeanMinusLambdaStd { lambda: 1.0 }.aggregate(&s), 2.0 - std);
     approx(SignalToNoise { eps: 0.0 }.aggregate(&s), 2.0 / std);
 

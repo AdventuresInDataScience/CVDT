@@ -88,7 +88,10 @@ clf.get_depth(), clf.get_n_leaves()   # sklearn-style size accessors
 
 How a continuous split reads depends on `split_style`. With the default
 **`"threshold"`** (CART-style ordered cut) the *true* branch is `x < upper` —
-`lower` is `-inf`. With **`"bin"`** (the original single-bin behaviour) the true
+`lower` is `-inf`. When a node has missing values, the threshold sweep can also
+choose the **presence** split (`lower = -inf`, `upper = +inf`, shown as
+`x is present`): every present value is true and only missing values are
+false, which lets the tree use informative missingness. With **`"bin"`** (the original single-bin behaviour) the true
 branch is the half-open interval `lower <= x < upper` (a one-sided inequality
 when one end is open). A categorical split routes true when the feature equals a
 specific category. The "true" branch is always the one that matches — missing /
@@ -129,7 +132,9 @@ continuous `state` is turned into a partition is controlled by `split_style`:
   - **`SplitStyle::Threshold`** (default) — a CART-style *ordered* cut: the true
     branch is `x < edge`, where `edge` is one of the quantile boundaries, so the
     tree can recursively narrow a range. Candidate cuts are the `E` boundaries;
-    raise `n_bins` for finer resolution.
+    raise `n_bins` for finer resolution. If the node has missing values, one
+    more cut is offered: "x is present" (all present values true, missing
+    false), on both the strict and fast paths.
   - **`SplitStyle::BinMembership`** — a single quantile bin vs. the rest
     (`lower <= x < upper`), the original one-vs-rest framing. Kept for comparison.
 - **Categorical** features use their integer category id directly, so `state` is
@@ -142,17 +147,60 @@ in the true branch, so they route to the "not-in-state" / right child.
 
 ## The per-fold score
 
-For a candidate on a validation fold the score is the impurity **decrease**
+By default (`Scoring::Honest`, Python `scoring="honest"`) every candidate is
+scored **out of sample**: the parent and child models (class proportions,
+means, or medians) are fit on the *training* fold and their loss is measured
+on the *validation* fold:
 
 ```
-gain = parent_impurity(val) - weighted_child_impurity(val)
+gain = (L_val(parent fit on train) - L_val(children fit on train)) / n_val
 ```
 
-computed on the validation labels, where the validation samples are partitioned
-using an encoder fit on the *training* fold. Higher is better. A fold is skipped
-for a candidate when either child is empty; a candidate with no successful folds
-loses. The aggregator turns the vector of per-fold gains into the final ranking
-number.
+`L` is the Brier score for Gini, log-loss for entropy, and squared / absolute
+error for regression — the held-out counterparts of each impurity, in the same
+units. Evaluated in-sample they reduce exactly to `n · impurity` for Gini,
+squared and absolute error; for entropy the log-loss uses Jeffreys smoothing
+(α = 0.5) so an unseen class costs a finite amount, which makes it equal
+`n · entropy` only approximately. A split with no signal scores **at or below
+zero in expectation**, removing the upward bias of in-sample scoring. A child
+that is empty on the training side predicts with the training parent. The
+aggregator turns the vector of per-fold gains into the final ranking number.
+
+Honest scoring is not, by itself, a reliable stopping rule. The tree keeps the
+*best* of many candidates (every feature × cut), and the maximum of many noisy,
+near-zero scores is usually positive, so with the default
+`min_impurity_decrease = 0` pure noise still splits. The effect is strongest
+at small nodes, which honest scoring keeps splitting (in-sample scoring had an
+implicit floor there: a fold with an empty validation child did not count), so
+on noise an honest tree is not reliably smaller than a 0.7 one. To stop noise
+splits, add the permutation-null test (`null_permutations`, e.g. 19), which
+compares the best real score with the best score found on permuted targets and
+so accounts for the search. The default `min_samples_leaf = 30` already keeps
+trees away from the tiny nodes where this is worst.
+
+`Scoring::InSample` (`scoring="in_sample"`) keeps the pre-0.8 score,
+`parent_impurity(val) - weighted_child_impurity(val)` on the validation labels
+alone. Because impurity is concave that quantity is never negative, even for
+pure noise, and its upward bias grows as nodes shrink — which made pre-0.8
+trees grow to `max_depth` and degrade on deep, low-signal problems.
+
+## Low-signal toolkit (v0.8)
+
+These options target problems where the signal is weak relative to noise:
+
+| Option | What it does |
+| --- | --- |
+| `scoring="honest"` (default) | Out-of-sample per-fold gain; a noise split scores ≤ 0 in expectation (the best of many can still be positive). |
+| `cv_repeats` | Repeated K-fold: `cv_folds × cv_repeats` scores per candidate, for a more stable spread estimate (the pooled scores are correlated, not independent). |
+| `aggregator="quantile"` + `agg_q` | Rank by a lower quantile of fold gains (risk-averse; a quantile of fold scores, not a confidence bound). |
+| `aggregator="moderated_signal_to_noise"` / `"moderated_mean_minus_lambda_std"` + `agg_d0` | Shrink each candidate's fold-score variance toward the node's median variance (limma-style), so a candidate is less likely to win just because its few folds agreed by chance. |
+| `null_permutations` + `null_quantile` | Permutation-null stopping test: accept a split only if it beats the best split found on permuted targets. Adapts to node size and to the number of candidates searched; the option to use when spurious splits matter. |
+| `shrinkage` | Hierarchical shrinkage of leaf predictions toward their ancestors (Agarwal et al., 2022); tree structure unchanged. |
+| `min_valid_folds` | Discard candidates that score on too few folds. |
+
+The fold-score standard deviation is now Bessel-corrected and undefined (`NaN`)
+with fewer than two folds, so variance-penalising aggregators no longer treat a
+single-fold candidate as perfectly consistent.
 
 ## Usage
 
@@ -210,6 +258,9 @@ held-out labels, which is the property that gives cross-validated scoring its
 anti-overfit behaviour. In practice this is a weak leak for a large speedup.
 
 Notes:
+- Missing / non-finite values are scored in the right child on both paths,
+exactly where they are routed (before 0.8 the fast path dropped them from
+scoring, which favoured mostly-missing features).
 - MAE is unavailable in fast mode (the median has no additive statistic);
   `fit` returns an error suggesting `Strict`.
 - Categorical features are densely re-indexed; a feature with more distinct
@@ -326,6 +377,11 @@ crate are pulled in *only* under that feature. Build with
 parameters and examples.
 
 ## Status and future work
+
+**v0.8.0 has not yet been compiled, tested or benchmarked.** See
+[`ROADMAP.md`](ROADMAP.md) for the next steps (compile and test, a go/no-go
+pilot, then the full benchmark), the prior art found in a literature search,
+the specific novelty claim to target, and the features deliberately deferred.
 
 The histogram fast path (v2) implements the largest per-node wins: single-pass
 fold histograms, sufficient-statistic scoring with total−cell subtraction,

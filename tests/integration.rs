@@ -188,11 +188,9 @@ fn custom_aggregator_via_trait_object() {
 
     let cols = vec![Column::Categorical(vec![0, 0, 1, 1, 0, 0, 1, 1])];
     let y = vec![0usize, 0, 1, 1, 0, 0, 1, 1];
-    let mut tree = DecisionTree::new(
-        Classification::gini(2),
-        default_params_with_cv(2, 1),
-        Box::new(Meanish),
-    );
+    let mut params = default_params_with_cv(2, 1);
+    params.min_samples_leaf = 1; // 8 samples: smaller than the default leaf size
+    let mut tree = DecisionTree::new(Classification::gini(2), params, Box::new(Meanish));
     tree.fit(&cols, &y).unwrap();
     assert_eq!(tree.predict_one(&[FeatureValue::cat(0)]).class, 0);
     assert_eq!(tree.predict_one(&[FeatureValue::cat(1)]).class, 1);
@@ -241,7 +239,9 @@ fn fast_regressor_fits_step_function() {
         y.push(if i < 25 { 1.0 } else { 5.0 });
     }
     let cols = vec![Column::Continuous(x)];
-    let mut tree = DecisionTree::new(Regression::mse(), fast_params(5, 7), Box::new(Mean));
+    let mut params = fast_params(5, 7);
+    params.min_samples_leaf = 1; // 50 samples: a 25 | 25 split needs leaves < 30
+    let mut tree = DecisionTree::new(Regression::mse(), params, Box::new(Mean));
     tree.fit(&cols, &y).unwrap();
 
     let preds = tree.predict(&cont_samples(&[0.1, 0.9]));

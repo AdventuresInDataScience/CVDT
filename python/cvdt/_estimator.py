@@ -88,6 +88,20 @@ _AGGREGATORS = {
     "trimmed_mean",
     "signal_to_noise",
     "mean_minus_lambda_std",
+    "quantile",
+    "moderated_signal_to_noise",
+    "moderated_mean_minus_lambda_std",
+}
+
+_SCORINGS = {"honest", "in_sample"}
+
+# Values that reproduce older behaviour, used when unpickling an estimator saved
+# before the parameter existed. Parameters not listed here did not change
+# behaviour when they were introduced, so their current default is used.
+_LEGACY_PARAMS = {
+    "split_style": "bin",  # added in 0.7; earlier trees used single-bin splits
+    "scoring": "in_sample",  # added in 0.8; earlier fold scores were in-sample
+    "min_valid_folds": 1,  # added in 0.8; earlier, one successful fold sufficed
 }
 
 _OBJECTIVES = {"precision", "recall", "f1", "fbeta", "accuracy"}
@@ -111,13 +125,65 @@ class _CVDTBase(BaseEstimator):
           is ``x < edge`` and the right child is everything else, where ``edge``
           is one of the ``n_bins - 1`` quantile boundaries. This respects the
           natural ordering of a continuous variable, so the tree can recursively
-          narrow a range; increase ``n_bins`` for finer thresholds.
+          narrow a range; increase ``n_bins`` for finer thresholds. When a node
+          has missing values, one more cut is offered: "x is present" (every
+          present value left, missing right).
         - ``"bin"`` — the original CVDT behaviour: a single quantile bin versus
           all others (``x in [lo, hi)``). Kept for comparison; ``"bin_membership"``
           is an accepted alias.
 
         Both styles are scored by cross-validation on held-out folds, and
         missing / non-finite values always route to the right child.
+
+    scoring : {"honest", "in_sample"}, default="honest"
+        ``"honest"`` fits the parent/child models (class proportions, means,
+        medians) on each training fold and measures their loss (Brier,
+        log-loss, squared / absolute error) on the held-out fold, so a split
+        with no signal scores <= 0 in expectation. The tree keeps the best of
+        many candidates, though, and that maximum is usually positive even on
+        pure noise, so on its own this does not stop noise splits (least of
+        all at small nodes); use ``null_permutations`` and/or
+        ``min_samples_leaf`` for that. ``"in_sample"`` reproduces
+        CVDT <= 0.7, where the per-fold gain is impurity decrease on the
+        validation labels alone (never negative, biased upward on small
+        nodes). Ignored by objective mode, which is already honest.
+    cv_repeats : int, default=1
+        Repeated K-fold: independently shuffled K-fold rounds per node, pooled
+        into ``cv_folds * cv_repeats`` scores per candidate. Stabilises the
+        spread estimate used by variance-aware aggregators (the pooled scores
+        reuse the same samples, so they are correlated). Cost is linear.
+    min_valid_folds : int, default=2
+        Candidates scoring on fewer folds than this are discarded.
+    null_permutations : int, default=0
+        If > 0, a permutation-null stopping test at every node: targets are
+        permuted this many times, all candidates rescored, and a split is
+        accepted only if its score beats the ``null_quantile`` quantile of the
+        permuted best scores. Adapts to node size and the number of candidates
+        searched, so unlike honest scoring alone it accounts for the search;
+        19 is a reasonable start. Cost: ``null_permutations`` extra scorings at
+        each node whose best score passes ``min_impurity_decrease``.
+    null_quantile : float, default=0.95
+        Quantile of the permutation null the best split must beat.
+    shrinkage : float, default=0.0
+        Hierarchical-shrinkage strength (Agarwal et al., 2022): each node's
+        deviation from its parent is weighted by ``1 / (1 + shrinkage / n_parent)``.
+        Leaves the tree structure unchanged; 0 disables it.
+    agg_q : float, default=0.25
+        Quantile for ``aggregator="quantile"``: a quantile of the per-fold
+        scores (risk-averse), not a confidence bound on the mean gain.
+    min_samples_leaf : int, default=30
+        Minimum samples in each child. Candidate splits that would leave a
+        smaller child are excluded before the best one is chosen. The default
+        follows the usual n >= 30 rule of thumb for a stable mean or
+        proportion and stops honest scoring from chasing noise at tiny nodes;
+        it also means a node needs at least 60 samples to split, so lower it
+        (e.g. to 5 or 1) for small datasets. With ``split_style="bin"`` a
+        child is a single quantile bin, so a node of ``n`` samples can only
+        split if ``n / n_bins`` exceeds ``min_samples_leaf``.
+    agg_d0 : float, default=4.0
+        Prior weight (in fold-equivalents) for the ``moderated_*`` aggregators,
+        which shrink each candidate's fold-score variance toward the median
+        variance of all candidates at the node.
     """
 
     # -- shared param validation ------------------------------------------
@@ -137,6 +203,24 @@ class _CVDTBase(BaseEstimator):
             raise ValueError("n_bins must be >= 2")
         if self.cv_folds < 2:
             raise ValueError("cv_folds must be >= 2")
+        if self.scoring not in _SCORINGS:
+            raise ValueError(
+                f"scoring must be one of {sorted(_SCORINGS)}, got {self.scoring!r}"
+            )
+        if self.cv_repeats < 1:
+            raise ValueError("cv_repeats must be >= 1")
+        if self.min_valid_folds < 1:
+            raise ValueError("min_valid_folds must be >= 1")
+        if self.null_permutations < 0:
+            raise ValueError("null_permutations must be >= 0")
+        if not (0.0 <= self.null_quantile <= 1.0):
+            raise ValueError("null_quantile must be in [0, 1]")
+        if self.shrinkage < 0:
+            raise ValueError("shrinkage must be >= 0")
+        if not (0.0 <= self.agg_q <= 1.0):
+            raise ValueError("agg_q must be in [0, 1]")
+        if self.agg_d0 < 0:
+            raise ValueError("agg_d0 must be >= 0")
 
     def _common_kwargs(self, categorical):
         return dict(
@@ -158,6 +242,16 @@ class _CVDTBase(BaseEstimator):
             n_threads=int(self.n_threads),
             parallel_min_samples=int(self.parallel_min_samples),
             categorical=categorical,
+            extra=dict(
+                scoring=str(self.scoring),
+                cv_repeats=int(self.cv_repeats),
+                min_valid_folds=int(self.min_valid_folds),
+                null_permutations=int(self.null_permutations),
+                null_quantile=float(self.null_quantile),
+                shrinkage=float(self.shrinkage),
+                agg_q=float(self.agg_q),
+                agg_d0=float(self.agg_d0),
+            ),
         )
 
     # -- tags (new + legacy APIs) -----------------------------------------
@@ -189,8 +283,24 @@ class _CVDTBase(BaseEstimator):
         state = dict(state)
         tree = state.pop("__cvdt_tree__", None)
         super().__setstate__(state)
+        self._fill_missing_params()
         if tree is not None:
             self._model = self._rebuild_model(tree)
+
+    def _fill_missing_params(self):
+        # A pickle from an older CVDT lacks parameters added since, which would
+        # make ``get_params`` / ``repr`` / ``clone`` raise AttributeError. A
+        # missing parameter predates its introduction, so it gets the value
+        # that reproduces the behaviour the model was fitted with (see
+        # ``_LEGACY_PARAMS``), else its current default. The fitted tree itself
+        # is restored from the pickle and predicts exactly as before.
+        import inspect
+
+        params = inspect.signature(type(self).__init__).parameters
+        for name, p in params.items():
+            if p.default is inspect.Parameter.empty or name in self.__dict__:
+                continue
+            setattr(self, name, _LEGACY_PARAMS.get(name, p.default))
 
     def _rebuild_model(self, tree):  # pragma: no cover - overridden
         raise NotImplementedError
@@ -240,7 +350,7 @@ class CVDTClassifier(ClassifierMixin, _CVDTBase):
         beta=1.0,
         max_depth=8,
         min_samples_split=2,
-        min_samples_leaf=1,
+        min_samples_leaf=30,
         min_impurity_decrease=0.0,
         n_bins=8,
         cv_folds=5,
@@ -256,6 +366,14 @@ class CVDTClassifier(ClassifierMixin, _CVDTBase):
         n_threads=1,
         parallel_min_samples=512,
         categorical_features=None,
+        scoring="honest",
+        cv_repeats=1,
+        min_valid_folds=2,
+        null_permutations=0,
+        null_quantile=0.95,
+        shrinkage=0.0,
+        agg_q=0.25,
+        agg_d0=4.0,
     ):
         self.criterion = criterion
         self.objective = objective
@@ -280,6 +398,14 @@ class CVDTClassifier(ClassifierMixin, _CVDTBase):
         self.n_threads = n_threads
         self.parallel_min_samples = parallel_min_samples
         self.categorical_features = categorical_features
+        self.scoring = scoring
+        self.cv_repeats = cv_repeats
+        self.min_valid_folds = min_valid_folds
+        self.null_permutations = null_permutations
+        self.null_quantile = null_quantile
+        self.shrinkage = shrinkage
+        self.agg_q = agg_q
+        self.agg_d0 = agg_d0
 
     def fit(self, X, y):
         self._validate_common()
@@ -405,7 +531,7 @@ class CVDTRegressor(RegressorMixin, _CVDTBase):
         criterion="mse",
         max_depth=8,
         min_samples_split=2,
-        min_samples_leaf=1,
+        min_samples_leaf=30,
         min_impurity_decrease=0.0,
         n_bins=8,
         cv_folds=5,
@@ -421,6 +547,14 @@ class CVDTRegressor(RegressorMixin, _CVDTBase):
         n_threads=1,
         parallel_min_samples=512,
         categorical_features=None,
+        scoring="honest",
+        cv_repeats=1,
+        min_valid_folds=2,
+        null_permutations=0,
+        null_quantile=0.95,
+        shrinkage=0.0,
+        agg_q=0.25,
+        agg_d0=4.0,
     ):
         self.criterion = criterion
         self.max_depth = max_depth
@@ -441,6 +575,14 @@ class CVDTRegressor(RegressorMixin, _CVDTBase):
         self.n_threads = n_threads
         self.parallel_min_samples = parallel_min_samples
         self.categorical_features = categorical_features
+        self.scoring = scoring
+        self.cv_repeats = cv_repeats
+        self.min_valid_folds = min_valid_folds
+        self.null_permutations = null_permutations
+        self.null_quantile = null_quantile
+        self.shrinkage = shrinkage
+        self.agg_q = agg_q
+        self.agg_d0 = agg_d0
 
     def fit(self, X, y):
         self._validate_common()

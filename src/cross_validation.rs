@@ -8,7 +8,17 @@
 //! computation to a [`Criterion`]. For each fold it fits the (continuous) bin
 //! edges on the *training* samples, applies them to the *validation* samples,
 //! and asks the criterion for the impurity decrease on the validation labels.
-//! This is what makes the score an out-of-sample estimate of split quality.
+//!
+//! Two scoring modes exist (see [`Scoring`]). The legacy
+//! [`Scoring::InSample`] mode computes `parent − weighted child` impurity
+//! entirely on the validation labels; because impurity is concave that is
+//! **never negative**, even for pure-noise splits, so the training fold only
+//! contributes bin edges. [`Scoring::Honest`] (the default) instead fits the
+//! parent and child models (class proportions / means / medians) on the
+//! training fold and measures their loss on the validation fold, so a split
+//! that does not generalise scores below zero *in expectation*. (The best of
+//! many such candidates can still score above zero by chance; see
+//! `TreeParams::null_permutations`.)
 
 use crate::criterion::Criterion;
 use crate::data::{Column, SampleId};
@@ -36,8 +46,29 @@ impl SplitMix64 {
     }
 
     /// Uniform integer in `0..bound` (bound must be > 0).
-    fn below(&mut self, bound: u64) -> u64 {
+    pub fn below(&mut self, bound: u64) -> u64 {
         self.next_u64() % bound
+    }
+}
+
+/// How a candidate split is scored on a fold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scoring {
+    /// Out-of-sample: models fit on the training fold, loss measured on the
+    /// validation fold (Brier for Gini, log-loss for entropy, squared /
+    /// absolute error for regression). Per-fold gains can be negative, and
+    /// their expectation is ≤ 0 for splits carrying no signal. This removes
+    /// the per-candidate bias, not the selection effect of keeping the best
+    /// candidate. Default.
+    Honest,
+    /// Legacy (≤ 0.7) behaviour: impurity decrease computed on the
+    /// validation labels alone. Always ≥ 0 and biased upward on small nodes.
+    InSample,
+}
+
+impl Default for Scoring {
+    fn default() -> Self {
+        Scoring::Honest
     }
 }
 
@@ -164,7 +195,10 @@ pub struct FoldStats {
     pub mean: f64,
     /// Median of `scores` (`-inf` when there are no successful folds).
     pub median: f64,
-    /// Population standard deviation of `scores` (`0` when empty).
+    /// Sample standard deviation of `scores` (Bessel-corrected, `n − 1`).
+    /// `NaN` when fewer than two folds succeeded: the spread is undefined, so
+    /// variance-penalising aggregators score such candidates as non-finite
+    /// (excluded) rather than treating them as perfectly consistent.
     pub std: f64,
     /// Number of folds that produced a valid (non-degenerate) split.
     pub n_success: usize,
@@ -181,21 +215,24 @@ impl FoldStats {
                 scores,
                 mean: f64::NEG_INFINITY,
                 median: f64::NEG_INFINITY,
-                std: 0.0,
+                std: f64::NAN,
                 n_success: 0,
                 n_total,
             };
         }
         let mean = scores.iter().sum::<f64>() / n as f64;
-        let var = scores
-            .iter()
-            .map(|x| {
-                let d = x - mean;
-                d * d
-            })
-            .sum::<f64>()
-            / n as f64;
-        let std = var.sqrt();
+        let std = if n < 2 {
+            f64::NAN
+        } else {
+            let ss = scores
+                .iter()
+                .map(|x| {
+                    let d = x - mean;
+                    d * d
+                })
+                .sum::<f64>();
+            (ss / (n - 1) as f64).sqrt()
+        };
         let mut sorted = scores.clone();
         sorted.sort_by(|a, b| a.total_cmp(b));
         let median = if n % 2 == 1 {
@@ -211,6 +248,24 @@ impl FoldStats {
             n_success: n,
             n_total,
         }
+    }
+}
+
+impl FoldStats {
+    /// Sample variance (`std²`), `NaN` when undefined.
+    pub fn var(&self) -> f64 {
+        self.std * self.std
+    }
+
+    /// Merge the scores of several fold sets (e.g. repeated K-fold) into one.
+    pub fn merged(parts: &[&FoldStats]) -> FoldStats {
+        let mut scores = Vec::new();
+        let mut n_total = 0;
+        for p in parts {
+            scores.extend_from_slice(&p.scores);
+            n_total += p.n_total;
+        }
+        FoldStats::from_scores(scores, n_total)
     }
 }
 
@@ -252,12 +307,32 @@ pub(crate) fn fold_train_val_codes(
     }
 }
 
+#[inline]
+fn goes_left(code: u32, state: u32, prefix: bool) -> bool {
+    // Threshold: left is `code <= state` (i.e. `x < edge`). Missing codes are
+    // MISSING_BIN (u32::MAX) and never fall left, so they route right in both
+    // styles. Single-bin: left is `code == state`.
+    if prefix {
+        code != crate::encoder::MISSING_BIN && code <= state
+    } else {
+        code == state
+    }
+}
+
 /// Evaluate every candidate `state` of one feature across all folds.
 ///
-/// Returns one [`FoldStats`] per state, aligned with `states`. The score for a
-/// fold is the impurity decrease on the validation labels:
-/// `parent - weighted_child`. A fold is skipped for a state when either child
-/// has fewer than `min_child` validation samples.
+/// Returns one [`FoldStats`] per state, aligned with `states`.
+///
+/// * [`Scoring::Honest`] (used when the criterion supports it): the per-fold
+///   score is `(L_parent − L_left − L_right) / n_val`, where each `L` is the
+///   total validation loss of the model fit on the matching *training-fold*
+///   samples ([`Criterion::heldout_loss`]). A child that is empty on the
+///   training side predicts with the training parent (contributing zero
+///   gain). A fold is skipped only when its training or validation side is
+///   empty.
+/// * [`Scoring::InSample`]: the legacy impurity decrease on the validation
+///   labels; a fold is skipped when either child has fewer than `min_child`
+///   validation samples.
 #[allow(clippy::too_many_arguments)]
 pub fn eval_feature<T: Copy>(
     columns: &[Column],
@@ -269,7 +344,11 @@ pub fn eval_feature<T: Copy>(
     criterion: &dyn Criterion<Target = T>,
     min_child: usize,
     prefix: bool,
+    scoring: Scoring,
 ) -> Vec<FoldStats> {
+    if scoring == Scoring::Honest && criterion.supports_heldout() {
+        return eval_feature_honest(columns, targets, feature, states, folds, n_bins, criterion, prefix);
+    }
     let mut per_state: Vec<Vec<f64>> = vec![Vec::with_capacity(folds.len()); states.len()];
     let min_child = min_child.max(1);
 
@@ -286,15 +365,7 @@ pub fn eval_feature<T: Copy>(
             let mut left: Vec<T> = Vec::new();
             let mut right: Vec<T> = Vec::new();
             for (k, &code) in codes.iter().enumerate() {
-                // Threshold: left is `code <= state` (i.e. `x < edge`). Missing
-                // codes are MISSING_BIN (u32::MAX) and never fall left, so they
-                // route right in both styles. Single-bin: left is `code == state`.
-                let goes_left = if prefix {
-                    code != crate::encoder::MISSING_BIN && code <= state
-                } else {
-                    code == state
-                };
-                if goes_left {
+                if goes_left(code, state, prefix) {
                     left.push(val_targets[k]);
                 } else {
                     right.push(val_targets[k]);
@@ -307,6 +378,80 @@ pub fn eval_feature<T: Copy>(
             let ir = criterion.impurity(&right);
             let child = (left.len() as f64 * il + right.len() as f64 * ir) / total as f64;
             per_state[si].push(parent - child);
+        }
+    }
+
+    per_state
+        .into_iter()
+        .map(|s| FoldStats::from_scores(s, folds.len()))
+        .collect()
+}
+
+/// Honest (train-fit, validation-scored) variant of [`eval_feature`].
+#[allow(clippy::too_many_arguments)]
+fn eval_feature_honest<T: Copy>(
+    columns: &[Column],
+    targets: &[T],
+    feature: usize,
+    states: &[u32],
+    folds: &[Fold],
+    n_bins: usize,
+    criterion: &dyn Criterion<Target = T>,
+    prefix: bool,
+) -> Vec<FoldStats> {
+    let mut per_state: Vec<Vec<f64>> = vec![Vec::with_capacity(folds.len()); states.len()];
+
+    for fold in folds {
+        if fold.val.is_empty() || fold.train.is_empty() {
+            continue;
+        }
+        // Edges fit on the training fold, applied to both sides.
+        let (tcodes, vcodes) = fold_train_val_codes(&columns[feature], fold, n_bins);
+        let tr: Vec<T> = fold.train.iter().map(|&i| targets[i]).collect();
+        let va: Vec<T> = fold.val.iter().map(|&i| targets[i]).collect();
+        let n_val = va.len() as f64;
+        let parent = match criterion.heldout_loss(&tr, &va) {
+            Some(l) if l.is_finite() => l,
+            _ => continue,
+        };
+
+        let mut tl: Vec<T> = Vec::with_capacity(tr.len());
+        let mut trr: Vec<T> = Vec::with_capacity(tr.len());
+        let mut vl: Vec<T> = Vec::with_capacity(va.len());
+        let mut vr: Vec<T> = Vec::with_capacity(va.len());
+        for (si, &state) in states.iter().enumerate() {
+            tl.clear();
+            trr.clear();
+            vl.clear();
+            vr.clear();
+            for (k, &code) in tcodes.iter().enumerate() {
+                if goes_left(code, state, prefix) {
+                    tl.push(tr[k]);
+                } else {
+                    trr.push(tr[k]);
+                }
+            }
+            for (k, &code) in vcodes.iter().enumerate() {
+                if goes_left(code, state, prefix) {
+                    vl.push(va[k]);
+                } else {
+                    vr.push(va[k]);
+                }
+            }
+            let child_loss = |t: &[T], v: &[T]| -> f64 {
+                if v.is_empty() {
+                    return 0.0;
+                }
+                // Empty training child: predict with the training parent.
+                let fit_on = if t.is_empty() { &tr[..] } else { t };
+                criterion.heldout_loss(fit_on, v).unwrap_or(f64::NAN)
+            };
+            let ll = child_loss(&tl[..], &vl[..]);
+            let lr = child_loss(&trr[..], &vr[..]);
+            let gain = (parent - ll - lr) / n_val;
+            if gain.is_finite() {
+                per_state[si].push(gain);
+            }
         }
     }
 
@@ -362,7 +507,10 @@ mod tests {
         assert_eq!(s.n_success, 2);
         assert!((s.mean - 2.0).abs() < 1e-9);
         assert!((s.median - 2.0).abs() < 1e-9);
-        assert!((s.std - 1.0).abs() < 1e-9);
+        // Sample std of {1, 3} = sqrt(2).
+        assert!((s.std - 2f64.sqrt()).abs() < 1e-9);
+        // A single fold has undefined spread.
+        assert!(FoldStats::from_scores(vec![1.0], 2).std.is_nan());
     }
 
     #[test]
@@ -380,8 +528,32 @@ mod tests {
         let idx: Vec<usize> = (0..8).collect();
         let folds = KFold::new(4, 5).folds(&idx);
         let gini = Gini::new(2);
-        let stats = eval_feature(&columns, &targets, 0, &[0, 1], &folds, 2, &gini, 1, false);
-        // At least one state should show a strictly positive mean gain.
-        assert!(stats.iter().any(|s| s.n_success > 0 && s.mean > 0.0));
+        for scoring in [Scoring::Honest, Scoring::InSample] {
+            let stats =
+                eval_feature(&columns, &targets, 0, &[0, 1], &folds, 2, &gini, 1, false, scoring);
+            // At least one state should show a strictly positive mean gain.
+            assert!(stats.iter().any(|s| s.n_success > 0 && s.mean > 0.0));
+        }
+    }
+
+    #[test]
+    fn honest_scores_noise_below_in_sample() {
+        // Deterministic pseudo-noise: label independent of the feature.
+        let mut rng = SplitMix64::new(11);
+        let n = 400;
+        let x: Vec<f64> = (0..n).map(|_| (rng.next_u64() % 1000) as f64).collect();
+        let y: Vec<usize> = (0..n).map(|_| (rng.next_u64() % 2) as usize).collect();
+        let columns = vec![Column::Continuous(x)];
+        let idx: Vec<usize> = (0..n).collect();
+        let folds = KFold::new(5, 3).folds(&idx);
+        let gini = Gini::new(2);
+        let states: Vec<u32> = (0..7).collect();
+        let ins = eval_feature(&columns, &y, 0, &states, &folds, 8, &gini, 1, true, Scoring::InSample);
+        let hon = eval_feature(&columns, &y, 0, &states, &folds, 8, &gini, 1, true, Scoring::Honest);
+        // In-sample gains are never negative; honest gains are smaller on noise.
+        assert!(ins.iter().all(|s| s.scores.iter().all(|&g| g >= -1e-12)));
+        let m_ins: f64 = ins.iter().map(|s| s.mean).sum::<f64>() / ins.len() as f64;
+        let m_hon: f64 = hon.iter().map(|s| s.mean).sum::<f64>() / hon.len() as f64;
+        assert!(m_hon < m_ins);
     }
 }
